@@ -16,9 +16,8 @@ use crate::{
 };
 use ahash::HashMap;
 use multi_share_bundle_merger::MultiShareBundleMerger;
-use reth_errors::ProviderResult;
-use reth_primitives::Address;
-use reth_provider::StateProviderBox;
+use reth::{primitives::Address, providers::StateProviderBox};
+use reth_interfaces::provider::ProviderResult;
 
 use prioritized_order_store::PrioritizedOrderStore;
 pub use test_data_generator::TestDataGenerator;
@@ -176,6 +175,10 @@ impl BlockOrders {
 
     pub fn get_all_orders(&self) -> Vec<SimulatedOrder> {
         self.prioritized_order_store.borrow().get_all_orders()
+    }
+
+    pub fn print_priority_queue(&self, tag: &str) {
+        self.prioritized_order_store.borrow().print_priority_queue(tag);
     }
 }
 impl SimulatedOrderSink for BlockOrders {

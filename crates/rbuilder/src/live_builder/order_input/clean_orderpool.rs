@@ -2,10 +2,14 @@ use super::OrderInputConfig;
 use crate::{
     live_builder::order_input::orderpool::OrderPool,
     telemetry::{set_current_block, set_ordepool_count},
+    utils::ProviderFactoryReopener,
 };
-use alloy_provider::{IpcConnect, Provider, ProviderBuilder};
+use ethers::{
+    middleware::Middleware,
+    providers::{Ipc, Provider},
+};
 use futures::StreamExt;
-use reth_provider::StateProviderFactory;
+use reth_db::database::Database;
 use std::{
     pin::pin,
     sync::{Arc, Mutex},
@@ -15,27 +19,25 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-/// Performs maintenance operations on every new header by calling OrderPool::head_updated.
-/// Also calls some functions to generate metrics.
-pub async fn spawn_clean_orderpool_job<P>(
+pub async fn spawn_clean_orderpool_job<DB: Database + Clone + 'static>(
     config: OrderInputConfig,
-    provider_factory: P,
+    provider_factory: ProviderFactoryReopener<DB>,
     orderpool: Arc<Mutex<OrderPool>>,
     global_cancellation: CancellationToken,
-) -> eyre::Result<JoinHandle<()>>
-where
-    P: StateProviderFactory + 'static,
-{
-    let ipc = IpcConnect::new(config.ipc_path);
-    let provider = ProviderBuilder::new().on_ipc(ipc).await?;
+) -> eyre::Result<JoinHandle<()>> {
+    let ipc = Ipc::connect(config.ipc_path).await?;
+    let provider = Provider::new(ipc);
+    {
+        // quickly check that we can subscribe, before moving provider into the task
+        let sub = provider.subscribe_blocks().await?;
+        sub.unsubscribe().await.unwrap_or_default();
+    }
 
     let handle = tokio::spawn(async move {
         info!("Clean orderpool job: started");
 
         let new_block_stream = match provider.subscribe_blocks().await {
-            Ok(subscription) => subscription
-                .into_stream()
-                .take_until(global_cancellation.cancelled()),
+            Ok(stream) => stream.take_until(global_cancellation.cancelled()),
             Err(err) => {
                 error!("Failed to subscribe to a new block stream: {:?}", err);
                 global_cancellation.cancel();
@@ -45,7 +47,9 @@ where
         let mut new_block_stream = pin!(new_block_stream);
 
         while let Some(block) = new_block_stream.next().await {
-            let block_number = block.header.number;
+            let provider_factory = provider_factory.provider_factory_unchecked();
+
+            let block_number = block.number.unwrap_or_default().as_u64();
             set_current_block(block_number);
             let state = match provider_factory.latest() {
                 Ok(state) => state,

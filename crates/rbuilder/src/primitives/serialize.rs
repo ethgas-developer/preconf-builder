@@ -5,7 +5,7 @@ use super::{
     TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
 };
 use alloy_primitives::Address;
-use reth_primitives::{Bytes, B256, U64};
+use reth::primitives::{Bytes, B256, U64};
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DefaultOnNull};
 use thiserror::Error;
@@ -262,9 +262,8 @@ pub struct CancelShareBundle {
     pub key: ShareBundleReplacementKey,
 }
 /// Since we use the same API (mev_sendBundle) to get new bundles and also to cancel them we need this struct
-#[allow(clippy::large_enum_variant)]
 pub enum RawShareBundleDecodeResult {
-    NewShareBundle(Box<ShareBundle>),
+    NewShareBundle(ShareBundle),
     CancelShareBundle(CancelShareBundle),
 }
 
@@ -276,7 +275,7 @@ impl RawShareBundle {
     ) -> Result<ShareBundle, RawShareBundleConvertError> {
         let decode_res = self.decode(encoding)?;
         match decode_res {
-            RawShareBundleDecodeResult::NewShareBundle(b) => Ok(*b),
+            RawShareBundleDecodeResult::NewShareBundle(b) => Ok(b),
             RawShareBundleDecodeResult::CancelShareBundle(_) => {
                 Err(RawShareBundleConvertError::FoundCancelExpectingBundle)
             }
@@ -334,7 +333,7 @@ impl RawShareBundle {
 
         bundle.hash_slow();
 
-        Ok(RawShareBundleDecodeResult::NewShareBundle(Box::new(bundle)))
+        Ok(RawShareBundleDecodeResult::NewShareBundle(bundle))
     }
 
     /// See [TransactionSignedEcRecoveredWithBlobs::envelope_encoded_no_blobs]
@@ -544,7 +543,8 @@ impl From<Order> for RawOrder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{address, fixed_bytes, keccak256, U256};
+    use alloy_primitives::{address, fixed_bytes, U256};
+    use ethers::utils::keccak256;
     use uuid::uuid;
 
     #[test]

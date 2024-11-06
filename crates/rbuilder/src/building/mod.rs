@@ -11,14 +11,10 @@ pub mod sim;
 pub mod testing;
 pub mod tracers;
 pub use block_orders::BlockOrders;
-use eth_sparse_mpt::SparseTrieSharedCache;
-use reth_db::Database;
-use reth_primitives::proofs::calculate_requests_root;
-use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
 
 use crate::{
     primitives::{Order, OrderId, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs},
-    roothash::{calculate_state_root, RootHashConfig, RootHashError},
+    roothash::calculate_state_root,
     utils::{a2r_withdrawal, calc_gas_limit, timestamp_as_u64, Signer},
 };
 use ahash::HashSet;
@@ -27,21 +23,18 @@ use reth::{
     payload::PayloadId,
     primitives::{
         constants::BEACON_NONCE, eip4844::calculate_excess_blob_gas, proofs,
-        revm_primitives::InvalidTransaction, Address, BlobTransactionSidecar, Block, Head, Header,
-        Receipt, Receipts, SealedBlock, Withdrawals, EMPTY_OMMER_ROOT_HASH, U256,
+        revm::config::revm_spec, revm_primitives::InvalidTransaction, Address,
+        BlobTransactionSidecar, Block, ChainSpec, Head, Header, Receipt, Receipts, SealedBlock,
+        Withdrawals, B256, EMPTY_OMMER_ROOT_HASH, U256,
     },
-    providers::ExecutionOutcome,
+    providers::{BundleStateWithReceipts, ProviderFactory},
     rpc::types::beacon::events::PayloadAttributesEvent,
     tasks::pool::BlockingTaskPool,
 };
-use reth_basic_payload_builder::{commit_withdrawals, WithdrawalsOutcome};
-use reth_chainspec::{ChainSpec, EthereumHardforks};
-use reth_errors::ProviderError;
-use reth_evm::system_calls::{
-    post_block_consolidation_requests_contract_call, post_block_withdrawal_requests_contract_call,
-    pre_block_beacon_root_contract_call, pre_block_blockhashes_contract_call,
+use reth_basic_payload_builder::{
+    commit_withdrawals, pre_block_beacon_root_contract_call, WithdrawalsOutcome,
 };
-use reth_evm_ethereum::{eip6110::parse_deposits_from_receipts, revm_spec, EthEvmConfig};
+use reth_interfaces::provider::ProviderError;
 use reth_node_api::PayloadBuilderAttributes;
 use reth_payload_builder::{database::CachedReads, EthPayloadBuilderAttributes};
 use revm::{
@@ -49,17 +42,11 @@ use revm::{
     primitives::{BlobExcessGasAndPrice, BlockEnv, CfgEnvWithHandlerCfg, SpecId},
 };
 use serde::Deserialize;
-use std::{
-    hash::Hash,
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{hash::Hash, str::FromStr, sync::Arc};
 use thiserror::Error;
 use time::OffsetDateTime;
-
 use self::tracers::SimulationTracer;
-use crate::utils::default_cfg_env;
+use crate::{backtest::BlockData, roothash::RootHashMode, utils::default_cfg_env};
 pub use block_orders::*;
 pub use built_block_trace::*;
 #[cfg(test)]
@@ -85,7 +72,7 @@ pub struct BlockBuildingContext {
     pub excess_blob_gas: Option<u64>,
     /// Version of the EVM that we are going to use
     pub spec_id: SpecId,
-    pub shared_sparse_mpt_cache: SparseTrieSharedCache,
+    pub slot_delta_to_start_block_build_ms: Option<time::Duration>,
 }
 
 impl BlockBuildingContext {
@@ -100,6 +87,7 @@ impl BlockBuildingContext {
         prefer_gas_limit: Option<u64>,
         extra_data: Vec<u8>,
         spec_id: Option<SpecId>,
+        slot_delta_to_start_block_build_ms: Option<time::Duration>,
     ) -> BlockBuildingContext {
         let attributes = EthPayloadBuilderAttributes::try_new(
             attributes.data.parent_block_hash,
@@ -139,7 +127,7 @@ impl BlockBuildingContext {
                 U256::ZERO,
                 parent.timestamp,
             );
-            revm_spec(&chain_spec, &head)
+            revm_spec(&chain_spec, head)
         });
         BlockBuildingContext {
             block_env,
@@ -151,52 +139,58 @@ impl BlockBuildingContext {
             extra_data,
             excess_blob_gas,
             spec_id,
-            shared_sparse_mpt_cache: Default::default(),
+            slot_delta_to_start_block_build_ms,
         }
     }
 
     /// `from_block_data` is used to create `BlockBuildingContext` from onchain block for backtest purposes
     /// spec_id None: we use the SpecId for the block.
     /// Note: We calculate SpecId based on the current block instead of the parent block so this will break for the blocks +-1 relative to the fork
-    pub fn from_onchain_block(
-        onchain_block: alloy_rpc_types::Block,
+    pub fn from_block_data(
+        block_data: &BlockData,
         chain_spec: Arc<ChainSpec>,
-        spec_id: Option<SpecId>,
         blocklist: HashSet<Address>,
-        coinbase: Address,
-        suggested_fee_recipient: Address,
-        builder_signer: Option<Signer>,
+        spec_id: Option<SpecId>,
+        slot_delta_to_start_block_build_ms: Option<time::Duration>,
     ) -> BlockBuildingContext {
-        let block_number = onchain_block.header.number;
+        let builder_signer =
+            Signer::try_from_secret(B256::random()).expect("failed to create signer");
 
-        let blob_excess_gas_and_price =
-            if chain_spec.is_cancun_active_at_timestamp(onchain_block.header.timestamp) {
-                Some(BlobExcessGasAndPrice::new(
-                    onchain_block.header.excess_blob_gas.unwrap_or_default() as u64,
-                ))
-            } else {
-                None
-            };
+        let blob_excess_gas_and_price = if chain_spec
+            .is_cancun_active_at_timestamp(block_data.onchain_block.header.timestamp)
+        {
+            Some(BlobExcessGasAndPrice::new(
+                block_data
+                    .onchain_block
+                    .header
+                    .excess_blob_gas
+                    .unwrap_or_default() as u64,
+            ))
+        } else {
+            None
+        };
         let block_env = BlockEnv {
-            number: U256::from(block_number),
-            coinbase,
-            timestamp: U256::from(onchain_block.header.timestamp),
-            difficulty: onchain_block.header.difficulty,
-            prevrandao: onchain_block.header.mix_hash,
+            number: U256::from(block_data.block_number),
+            coinbase: builder_signer.address,
+            timestamp: U256::from(block_data.onchain_block.header.timestamp),
+            difficulty: block_data.onchain_block.header.difficulty,
+            prevrandao: block_data.onchain_block.header.mix_hash,
             basefee: U256::from(
-                onchain_block
+                block_data
+                    .onchain_block
                     .header
                     .base_fee_per_gas
                     .expect("Failed to get basefee"),
             ), // TODO: improve
-            gas_limit: U256::from(onchain_block.header.gas_limit),
+            gas_limit: U256::from(block_data.onchain_block.header.gas_limit),
             blob_excess_gas_and_price,
         };
 
-        let cfg = default_cfg_env(&chain_spec, timestamp_as_u64(&onchain_block));
+        let cfg = default_cfg_env(&chain_spec, timestamp_as_u64(&block_data.onchain_block));
 
         let withdrawals = Withdrawals::new(
-            onchain_block
+            block_data
+                .onchain_block
                 .withdrawals
                 .clone()
                 .map(|w| w.into_iter().map(a2r_withdrawal).collect::<Vec<_>>())
@@ -205,24 +199,28 @@ impl BlockBuildingContext {
 
         let attributes = EthPayloadBuilderAttributes {
             id: PayloadId::new([0u8; 8]),
-            parent: onchain_block.header.parent_hash,
-            timestamp: timestamp_as_u64(&onchain_block),
-            suggested_fee_recipient,
-            prev_randao: onchain_block.header.mix_hash.unwrap_or_default(),
+            parent: block_data.onchain_block.header.parent_hash,
+            timestamp: timestamp_as_u64(&block_data.onchain_block),
+            suggested_fee_recipient: block_data.winning_bid_trace.proposer_fee_recipient,
+            prev_randao: block_data.onchain_block.header.mix_hash.unwrap_or_default(),
             withdrawals,
-            parent_beacon_block_root: onchain_block.header.parent_beacon_block_root,
+            parent_beacon_block_root: block_data.onchain_block.header.parent_beacon_block_root,
         };
         let spec_id = spec_id.unwrap_or_else(|| {
             // we use current block data instead of the parent block data to determine fork
             // this will break for one block after the fork
             revm_spec(
                 &chain_spec,
-                &Head::new(
-                    block_number,
-                    onchain_block.header.parent_hash,
-                    onchain_block.header.difficulty,
-                    onchain_block.header.total_difficulty.unwrap_or_default(),
-                    onchain_block.header.timestamp,
+                Head::new(
+                    block_data.block_number,
+                    block_data.onchain_block.header.parent_hash,
+                    block_data.onchain_block.header.difficulty,
+                    block_data
+                        .onchain_block
+                        .header
+                        .total_difficulty
+                        .unwrap_or_default(),
+                    block_data.onchain_block.header.timestamp,
                 ),
             )
         });
@@ -231,28 +229,17 @@ impl BlockBuildingContext {
             initialized_cfg: cfg,
             attributes,
             chain_spec,
-            builder_signer,
+            builder_signer: Some(builder_signer),
             blocklist,
             extra_data: Vec::new(),
-            excess_blob_gas: onchain_block.header.excess_blob_gas.map(|b| b as u64),
+            excess_blob_gas: block_data
+                .onchain_block
+                .header
+                .excess_blob_gas
+                .map(|b| b as u64),
             spec_id,
-            shared_sparse_mpt_cache: Default::default(),
+            slot_delta_to_start_block_build_ms,
         }
-    }
-
-    /// Useless BlockBuildingContext for testing in contexts where we can't avoid having a BlockBuildingContext.
-    pub fn dummy_for_testing() -> Self {
-        let mut onchain_block: alloy_rpc_types::Block = Default::default();
-        onchain_block.header.base_fee_per_gas = Some(0);
-        BlockBuildingContext::from_onchain_block(
-            onchain_block,
-            reth_chainspec::MAINNET.clone(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-        )
     }
 
     pub fn modify_use_suggested_fee_recipient_as_coinbase(&mut self) {
@@ -268,10 +255,6 @@ impl BlockBuildingContext {
     pub fn block(&self) -> u64 {
         self.block_env.number.to()
     }
-
-    pub fn coinbase_is_suggested_fee_recipient(&self) -> bool {
-        self.block_env.coinbase == self.attributes.suggested_fee_recipient
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,18 +268,17 @@ pub struct BlockBuildingConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Sorting {
-    /// Sorts the SimulatedOrders by its effective gas price. This not only includes the explicit gas price set in the tx but also the direct coinbase payments
-    /// so we compute it as (coinbase balance delta after executing the order) / (gas used)
     MevGasPrice,
-    /// Sorts the SimulatedOrders by its absolute profit which is computed as the coinbase balance delta after executing the order
     MaxProfit,
+    Preconf,
 }
 
 impl Sorting {
-    pub fn sorting_value(&self, sim_value: &SimValue) -> U256 {
+    pub fn sorting_value(&self, sim_value: &SimValue) -> Vec<U256> {
         match self {
-            Sorting::MevGasPrice => sim_value.mev_gas_price,
-            Sorting::MaxProfit => sim_value.coinbase_profit,
+            Sorting::MevGasPrice => vec![sim_value.mev_gas_price, U256::ZERO, U256::ZERO],
+            Sorting::MaxProfit => vec![sim_value.coinbase_profit, U256::ZERO, U256::ZERO],
+            Sorting::Preconf => vec![sim_value.avg_bid_price.unwrap_or_default(), sim_value.mev_gas_price],
         }
     }
 }
@@ -308,6 +290,7 @@ impl FromStr for Sorting {
         match s {
             "mev_gas_price" => Ok(Self::MevGasPrice),
             "max_profit" => Ok(Self::MaxProfit),
+            "preconf" => Ok(Self::Preconf),
             _ => eyre::bail!("Invalid algorithm"),
         }
     }
@@ -317,25 +300,20 @@ impl std::fmt::Display for Sorting {
         match self {
             Sorting::MevGasPrice => write!(f, "mev_gas_price"),
             Sorting::MaxProfit => write!(f, "max_profit"),
+            Sorting::Preconf => write!(f, "preconf"),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct PartialBlock<Tracer: SimulationTracer> {
-    /// Value used as allow_tx_skip on calls to [`PartialBlockFork`]
     pub discard_txs: bool,
-    /// If some [`enforce_inplace_sim_result`] is called after each tx to check the profit.
     pub enforce_sorting: Option<Sorting>,
     pub gas_used: u64,
-    /// Reserved gas for later use (usually final payout tx). When simulating we subtract this from the block gas limit.
     pub gas_reserved: u64,
     pub blob_gas_used: u64,
-    /// Updated after each order.
     pub coinbase_profit: U256,
-    /// Txs belonging to successfully executed orders.
     pub executed_tx: Vec<TransactionSignedEcRecoveredWithBlobs>,
-    /// Receipts belonging to successfully executed orders.
     pub receipts: Vec<Receipt>,
     pub tracer: Tracer,
 }
@@ -348,7 +326,6 @@ pub struct ExecutionResult {
     pub order: Order,
     pub txs: Vec<TransactionSignedEcRecoveredWithBlobs>,
     /// Patch to get the executed OrderIds for merged sbundles (see: [`BundleOk::original_order_ids`],[`ShareBundleMerger`] )
-    /// Fully dropped orders (TxRevertBehavior::AllowedExcluded allows it!) are not included.
     pub original_order_ids: Vec<OrderId>,
     pub receipts: Vec<Receipt>,
     pub nonces_updated: Vec<(Address, u64)>,
@@ -384,23 +361,24 @@ impl ExecutionError {
     pub fn try_get_tx_too_high_error(&self, order: &Order) -> Option<(Address, u64)> {
         match self {
             ExecutionError::OrderError(OrderErr::Transaction(
-                TransactionErr::InvalidTransaction(InvalidTransaction::NonceTooHigh {
-                    tx: tx_nonce,
-                    ..
-                }),
-            )) => Some((order.list_txs().first()?.0.signer(), *tx_nonce)),
+                                           TransactionErr::InvalidTransaction(InvalidTransaction::NonceTooHigh {
+                                                                                  tx: tx_nonce,
+                                                                                  ..
+                                                                              }),
+                                       )) => Some((order.list_txs().first()?.0.tx.signer(), *tx_nonce)),
             ExecutionError::OrderError(OrderErr::Bundle(BundleErr::InvalidTransaction(
-                hash,
-                TransactionErr::InvalidTransaction(InvalidTransaction::NonceTooHigh {
-                    tx: tx_nonce,
-                    ..
-                }),
-            ))) => {
+                                                            hash,
+                                                            TransactionErr::InvalidTransaction(InvalidTransaction::NonceTooHigh {
+                                                                                                   tx: tx_nonce,
+                                                                                                   ..
+                                                                                               }),
+                                                        ))) => {
                 let signer = order
                     .list_txs()
                     .iter()
-                    .find(|(tx, _)| TransactionSignedEcRecoveredWithBlobs::hash(tx) == *hash)?
+                    .find(|(tx, _)| &tx.tx.hash == hash)?
                     .0
+                    .tx
                     .signer();
                 Some((signer, *tx_nonce))
             }
@@ -409,30 +387,12 @@ impl ExecutionError {
     }
 }
 
+#[derive(Debug)]
 pub struct FinalizeResult {
     pub sealed_block: SealedBlock,
     pub cached_reads: CachedReads,
     // sidecars for all txs in SealedBlock
     pub txs_blob_sidecars: Vec<Arc<BlobTransactionSidecar>>,
-    pub root_hash_time: Duration,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum FinalizeError {
-    #[error("Root hash error: {0:?}")]
-    RootHash(#[from] RootHashError),
-    #[error("Other error: {0:?}")]
-    Other(#[from] eyre::Report),
-}
-
-impl FinalizeError {
-    /// see `RootHashError::is_consistent_db_view_err`
-    pub fn is_consistent_db_view_err(&self) -> bool {
-        match self {
-            FinalizeError::RootHash(root_hash) => root_hash.is_consistent_db_view_err(),
-            FinalizeError::Other(_) => false,
-        }
-    }
 }
 
 impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
@@ -496,6 +456,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             ok_result.gas_used,
             ok_result.blob_gas_used,
             ok_result.paid_kickbacks.clone(),
+            ok_result.avg_bid_price,
         );
         if let Some(enforce_sorting) = self.enforce_sorting {
             match enforce_inplace_sim_result(enforce_sorting, &order.sim_value, &inplace_sim_result)
@@ -526,7 +487,7 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         }))
     }
 
-    /// Gets the block profit excluding the expected payout base gas that we'll pay.
+    /// Gets the block profit excluding the expected payout base gas that  we'll pay.
     pub fn get_proposer_payout_tx_value(
         &self,
         gas_limit: u64,
@@ -581,18 +542,14 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn finalize<P, DB>(
+    pub fn finalize<DB: reth_db::database::Database + Clone + 'static>(
         self,
-        state: &mut BlockState,
+        mut state: BlockState,
         ctx: &BlockBuildingContext,
-        provider: P,
-        root_hash_config: RootHashConfig,
+        provider_factory: ProviderFactory<DB>,
+        root_hash_mode: RootHashMode,
         root_hash_task_pool: BlockingTaskPool,
-    ) -> Result<FinalizeResult, FinalizeError>
-    where
-        DB: Database + Clone + 'static,
-        P: DatabaseProviderFactory<DB> + StateProviderFactory + Clone + 'static,
-    {
+    ) -> eyre::Result<FinalizeResult> {
         let (withdrawals_root, withdrawals) = {
             let mut db = state.new_db_ref();
             let WithdrawalsOutcome {
@@ -603,93 +560,51 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
                 &ctx.chain_spec,
                 ctx.attributes.timestamp,
                 ctx.attributes.withdrawals.clone(),
-            )
-            .map_err(|err| FinalizeError::Other(err.into()))?;
+            )?;
             db.as_mut().merge_transitions(PlainState);
             (withdrawals_root, withdrawals)
         };
 
-        let (requests, requests_root) = if ctx
-            .chain_spec
-            .is_prague_active_at_timestamp(ctx.attributes.timestamp())
-        {
-            let evm_config = EthEvmConfig::default();
-            let mut db = state.new_db_ref();
+        let (cached_reads, bundle) = state.into_parts();
 
-            let deposit_requests =
-                parse_deposits_from_receipts(&ctx.chain_spec, self.receipts.iter())
-                    .map_err(|err| FinalizeError::Other(err.into()))?;
-            let withdrawal_requests = post_block_withdrawal_requests_contract_call(
-                &evm_config,
-                db.as_mut(),
-                &ctx.initialized_cfg,
-                &ctx.block_env,
-            )
-            .map_err(|err| FinalizeError::Other(err.into()))?;
-            let consolidation_requests = post_block_consolidation_requests_contract_call(
-                &evm_config,
-                db.as_mut(),
-                &ctx.initialized_cfg,
-                &ctx.block_env,
-            )
-            .map_err(|err| FinalizeError::Other(err.into()))?;
-
-            let requests = [
-                deposit_requests,
-                withdrawal_requests,
-                consolidation_requests,
-            ]
-            .concat();
-            let requests_root = calculate_requests_root(&requests);
-            (Some(requests.into()), Some(requests_root))
-        } else {
-            (None, None)
-        };
-
-        let (cached_reads, bundle) = state.clone_bundle_and_cache();
-        let execution_outcome = ExecutionOutcome::new(
+        let bundle = BundleStateWithReceipts::new(
             bundle,
-            Receipts::from(vec![self
+            Receipts::from_vec(vec![self
                 .receipts
                 .into_iter()
                 .map(Option::Some)
                 .collect::<Vec<_>>()]),
             ctx.block_env.number.to::<u64>(),
-            vec![requests.clone().unwrap_or_default()],
         );
         let block_number = ctx.block_env.number.to::<u64>();
 
-        let receipts_root = execution_outcome
+        let receipts_root = bundle
             .receipts_root_slow(block_number)
             .expect("Number is in range");
-        let logs_bloom = execution_outcome
+        let logs_bloom = bundle
             .block_logs_bloom(block_number)
             .expect("Number is in range");
 
-        let start = Instant::now();
         let state_root = calculate_state_root(
-            provider,
+            provider_factory,
             ctx.attributes.parent,
-            &execution_outcome,
+            &bundle,
+            root_hash_mode,
             root_hash_task_pool,
-            ctx.shared_sparse_mpt_cache.clone(),
-            root_hash_config,
         )?;
-        let root_hash_time = start.elapsed();
 
         // create the block header
         let transactions_root = proofs::calculate_transaction_root(&self.executed_tx);
 
         // double check blocked txs
         for tx_with_blob in &self.executed_tx {
-            if ctx.blocklist.contains(&tx_with_blob.signer()) {
-                return Err(FinalizeError::Other(eyre::eyre!(
-                    "To from blocked address."
-                )));
+            let tx = &tx_with_blob.tx;
+            if ctx.blocklist.contains(&tx.signer()) {
+                return Err(eyre::eyre!("To from blocked address."));
             }
-            if let Some(to) = tx_with_blob.to() {
+            if let Some(to) = tx.to() {
                 if ctx.blocklist.contains(&to) {
-                    return Err(FinalizeError::Other(eyre::eyre!("Tx to blocked address")));
+                    return Err(eyre::eyre!("Tx to blocked address"));
                 }
             }
         }
@@ -730,26 +645,19 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
             parent_beacon_block_root: ctx.attributes.parent_beacon_block_root,
             blob_gas_used,
             excess_blob_gas,
-            requests_root,
         };
 
         let block = Block {
             header,
-            body: self
-                .executed_tx
-                .into_iter()
-                .map(|t| t.into_internal_tx_unsecure().into())
-                .collect(),
+            body: self.executed_tx.into_iter().map(|t| t.tx.into()).collect(),
             ommers: vec![],
             withdrawals,
-            requests,
         };
 
         Ok(FinalizeResult {
             sealed_block: block.seal_slow(),
             cached_reads,
             txs_blob_sidecars,
-            root_hash_time,
         })
     }
 
@@ -758,23 +666,14 @@ impl<Tracer: SimulationTracer> PartialBlock<Tracer> {
         ctx: &BlockBuildingContext,
         state: &mut BlockState,
     ) -> eyre::Result<()> {
-        let evm_config = EthEvmConfig::default();
         let mut db = state.new_db_ref();
         pre_block_beacon_root_contract_call(
             db.as_mut(),
-            &evm_config,
             &ctx.chain_spec,
+            ctx.block_env.number.to(),
             &ctx.initialized_cfg,
             &ctx.block_env,
-            ctx.attributes.parent_beacon_block_root(),
-        )?;
-        pre_block_blockhashes_contract_call(
-            db.as_mut(),
-            &evm_config,
-            &ctx.chain_spec,
-            &ctx.initialized_cfg,
-            &ctx.block_env,
-            ctx.attributes.parent,
+            &ctx.attributes,
         )?;
         db.as_mut().merge_transitions(BundleRetention::Reverts);
         Ok(())
@@ -817,11 +716,30 @@ fn enforce_inplace_sim_result(
     sim_result: &SimValue,
     inplace_sim_result: &SimValue,
 ) -> Result<(), ExecutionError> {
-    let (sim_value, inplace_value) = (
-        sort.sorting_value(sim_result),
-        sort.sorting_value(inplace_sim_result),
-    );
-    if (inplace_value * U256::from(100)) < (sim_value * U256::from(95)) {
+    // let (sim_value, inplace_value) = (
+    //     sort.sorting_value(sim_result),
+    //     sort.sorting_value(inplace_sim_result),
+    // );
+    // if (inplace_value * U256::from(100)) < (sim_value * U256::from(95)) {
+    //     Err(ExecutionError::LowerInsertedValue {
+    //         before: sim_result.clone(),
+    //         inplace: inplace_sim_result.clone(),
+    //     })
+    // } else {
+    //     Ok(())
+    // }
+    let sorting_items = sort.sorting_value(sim_result);
+    let inplace_sorting_items = sort.sorting_value(inplace_sim_result);
+    let mut has_err: bool = false;
+    for i in 0..sorting_items.len() {
+        if (inplace_sorting_items[i] * U256::from(100)) < (sorting_items[i] * U256::from(95)) {
+            has_err = true;
+        } else {
+            has_err = false;
+            break;
+        }
+    };
+    if has_err {
         Err(ExecutionError::LowerInsertedValue {
             before: sim_result.clone(),
             inplace: inplace_sim_result.clone(),

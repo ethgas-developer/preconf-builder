@@ -1,0 +1,69 @@
+# This pipeline builds docker images and pushes to ECR (https://ap-east-1.console.aws.amazon.com/ecr/repositories/private/857828702501/ethgas-preconf-builder?region=ap-east-1)
+#
+
+# The build image is Infinity's version of Atlassian's default image
+# with buildx and awscli installed on top (Can be found in DevOps project)
+image:
+  name: public.ecr.aws/y4k7q8y9/bitbucket-pipeline-runner
+
+definitions:
+  services:
+    docker:
+      image: docker:dind
+      memory: 7168 # max for a 2x step
+      variables:
+        DOCKER_OPTS: "--mtu=1300" # Reduce MTU to prevent hanging (See https://janosmiko.com/blog/2021-09-08-bitbucket-pipelines-runners-in-k8s/)
+  steps:
+    - step: &setup # This step only exists so it is easier to retry failed builds by choosing "Rerun failed steps"
+        name: "Setup"
+        runs-on:
+          - 'self.hosted'
+        script:
+          - echo "Getting ready to build ${BITBUCKET_REPO_SLUG}"
+    - step: &build-ethgas-preconf-builder
+        name: "Build ETHGas Preconf Builder"
+        runs-on:
+          - 'self.hosted'
+        services:
+          - docker
+        size: 2x # Indicating this is a large build step, doubling step memory to 8192 MB
+        script:
+          # Figure out the correct tags
+          - >
+            if test ! -z "${BITBUCKET_TAG}"; then
+              TAG=${BITBUCKET_TAG##*/}
+            else
+              TAG=${BITBUCKET_BRANCH##*/}
+            fi
+          - echo "Tagging image ethgas-preconf-builder with ${TAG} $([ $BITBUCKET_BRANCH == "main" ] && echo "and latest" )"
+          # Log in to ECR (this would not be necessary if we were using the pipe 'aws-ecr-push-image')
+          - >
+            if aws sts get-caller-identity; then
+              echo 'Logging into AWS ECR using role'
+              aws ecr get-login-password --region ap-east-1 | docker login --username AWS --password-stdin 857828702501.dkr.ecr.ap-east-1.amazonaws.com
+            else
+              echo 'Logging into AWS ECR using token'
+              curl -ksS bitbucket-pipeline-runner-service.bitbucket-pipeline-runners.svc.cluster.local:8080 | docker login --username AWS --password-stdin 857828702501.dkr.ecr.ap-east-1.amazonaws.com
+            fi
+          # Switch to a different docker driver as the multiple platforms feature is currently not supported in default
+          - docker buildx create --name docker-container --driver docker-container
+          # Build (for both arm64 and amd64 - if main branch also tag with latest) and push to ECR
+          # (Docker cannot support multi-arch images, so we can no longer use the pipe 'aws-ecr-push-image' see https://github.com/docker/roadmap/issues/371)
+          # (Caching using ECR registry, see https://medium.com/datamindedbe/how-we-reduced-our-docker-build-times-by-40-afea7b7f5fe7 and https://aws.amazon.com/blogs/containers/announcing-remote-cache-support-in-amazon-ecr-for-buildkit-clients/)
+          - >
+            if [ $BITBUCKET_BRANCH == "main" ]; then
+              docker buildx --builder docker-container build --push --platform linux/amd64 -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-preconf-builder:$TAG --cache-from type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-preconf-builder:cache --cache-to mode=max,image-manifest=true,oci-mediatypes=true,type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-preconf-builder:cache -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-preconf-builder .
+            else
+              docker buildx --builder docker-container build --push --platform linux/amd64 -t 857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-preconf-builder:$TAG --cache-from type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-preconf-builder:cache --cache-to mode=max,image-manifest=true,oci-mediatypes=true,type=registry,ref=857828702501.dkr.ecr.ap-east-1.amazonaws.com/ethgas-preconf-builder:cache .
+            fi
+
+pipelines:
+  default:
+   - parallel:
+      - step: *setup
+      - step: *build-ethgas-preconf-builder
+  tags:
+    '*': # Tag of any name 
+      - parallel:
+        - step: *setup
+        - step: *build-ethgas-preconf-builder

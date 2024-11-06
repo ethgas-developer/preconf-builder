@@ -10,9 +10,7 @@ use crate::{
 };
 use alloy_primitives::{utils::Unit, U256};
 use bigdecimal::num_traits::Pow;
-use ctor::ctor;
 use lazy_static::lazy_static;
-use metrics_macros::register_metrics;
 use prometheus::{
     Counter, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
     Registry,
@@ -35,46 +33,37 @@ const BLOCK_METRICS_TIMESTAMP_UPPER_DELTA: time::Duration = time::Duration::seco
 
 lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
-}
-
-register_metrics! {
-    pub static BLOCK_FILL_TIME: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_FILL_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_fill_time", "Block Fill Times (ms)")
             .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
         &["builder_name"]
     )
     .unwrap();
-    pub static BLOCK_FINALIZE_TIME: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_FINALIZE_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_finalize_time", "Block Finalize Times (ms)")
             .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
         &["builder_name"]
     )
     .unwrap();
-    pub static BLOCK_ROOT_HASH_TIME: HistogramVec = HistogramVec::new(
-        HistogramOpts::new("block_root_hash_time", "Block Root Hash Time (ms)")
-            .buckets(exponential_buckets_range(1.0, 2000.0, 100)),
-        &["builder_name"]
-    )
-    .unwrap();
-    pub static BLOCK_BUILT_TXS: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_BUILT_TXS: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_built_txs", "Transactions in the built block")
             .buckets(linear_buckets_range(1.0, 1000.0, 100)),
         &["builder_name"]
     )
     .unwrap();
-    pub static BLOCK_BUILT_BLOBS: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_BUILT_BLOBS: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_built_blobs", "Blobs in the built block")
             .buckets(linear_buckets_range(1.0, 32.0, 100)),
         &["builder_name"]
     )
     .unwrap();
-    pub static BLOCK_BUILT_GAS_USED: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_BUILT_GAS_USED: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_built_gas_used", "Gas used in the built block")
             .buckets(exponential_buckets_range(21_000.0, 30_000_000.0, 100)),
         &["builder_name"]
     )
     .unwrap();
-    pub static BLOCK_BUILT_SIM_GAS_USED: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_BUILT_SIM_GAS_USED: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
             "block_built_sim_gas_used",
             "Gas used in the built block including failing bundles"
@@ -83,7 +72,7 @@ register_metrics! {
         &["builder_name"]
     )
     .unwrap();
-    pub static BLOCK_BUILT_MGAS_PER_SECOND: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_BUILT_MGAS_PER_SECOND: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
             "block_built_mgas_per_second",
             "MGas/s for the built block (including failing txs)"
@@ -92,37 +81,42 @@ register_metrics! {
         &["builder_name"]
     )
     .unwrap();
-    pub static BLOCK_VALIDATION_TIME: HistogramVec = HistogramVec::new(
+    pub static ref BLOCK_VALIDATION_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_validation_time", "Block Validation Times (ms)")
             .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
-        &[]
+        &["builder_name"]
     )
     .unwrap();
-    pub static CURRENT_BLOCK: IntGauge =
+    pub static ref CURRENT_BLOCK: IntGauge =
         IntGauge::new("current_block", "Current Block").unwrap();
-    pub static ORDERPOOL_TXS: IntGauge =
+    pub static ref ORDERPOOL_TXS: IntGauge =
         IntGauge::new("orderpool_txs", "Transactions In The Orderpool").unwrap();
-    pub static ORDERPOOL_BUNDLES: IntGauge =
+    pub static ref ORDERPOOL_BUNDLES: IntGauge =
         IntGauge::new("orderpool_bundles", "Bundles In The Orderpool").unwrap();
-    pub static RELAY_ERRORS: IntCounterVec = IntCounterVec::new(
+    pub static ref RELAY_ERRORS: IntCounterVec = IntCounterVec::new(
         Opts::new("relay_errors", "counter of relay errors"),
         &["relay", "kind"]
     )
     .unwrap();
-    pub static BLOCK_SIM_ERRORS: IntCounterVec = IntCounterVec::new(
+    pub static ref BLOCK_SIM_ERRORS: IntCounterVec = IntCounterVec::new(
         Opts::new("block_sim_errors", "counter of block simulation errors"),
         &[]
     )
     .unwrap();
-    pub static SIMULATED_OK_ORDERS: IntCounter =
+    pub static ref BLOCK_API_ERRORS: IntCounterVec = IntCounterVec::new(
+        Opts::new("block_api_errors", "counter of the block processor errors"),
+        &[]
+    )
+    .unwrap();
+    pub static ref SIMULATED_OK_ORDERS: IntCounter =
         IntCounter::new("simulated_ok_orders", "Simulated succeeded orders").unwrap();
-    pub static SIMULATED_FAILED_ORDERS: IntCounter =
+    pub static ref SIMULATED_FAILED_ORDERS: IntCounter =
         IntCounter::new("simulated_failed_orders", "Simulated failed orders").unwrap();
-    pub static SIMULATION_GAS_USED: IntCounter =
+    pub static ref SIMULATION_GAS_USED: IntCounter =
         IntCounter::new("simulation_gas_used", "Simulation gas used").unwrap();
-    pub static ACTIVE_SLOTS: IntCounter =
+    pub static ref ACTIVE_SLOTS: IntCounter =
         IntCounter::new("active_slots", "Slots when builder was active").unwrap();
-    pub static INITIATED_SUBMISSIONS: IntCounterVec = IntCounterVec::new(
+    pub static ref INITIATED_SUBMISSIONS: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "initiated_submissions",
             "Number of initiated submissions to the relays"
@@ -130,18 +124,18 @@ register_metrics! {
         &["optimistic"],
     )
     .unwrap();
-    pub static RELAY_SUBMIT_TIME: HistogramVec = HistogramVec::new(
+    pub static ref RELAY_SUBMIT_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("relay_submit_time", "Time to send bid to the relay (ms)")
             .buckets(linear_buckets_range(0.0, 3000.0, 50)),
         &["relay"],
     )
     .unwrap();
-    pub static VERSION: IntGaugeVec = IntGaugeVec::new(
+    pub static ref VERSION: IntGaugeVec = IntGaugeVec::new(
         Opts::new("version", "Version of the builder"),
         &["git", "git_ref", "build_time_utc"]
     )
     .unwrap();
-    pub static RELAY_ACCEPTED_SUBMISSIONS: IntCounterVec = IntCounterVec::new(
+    pub static ref RELAY_ACCEPTED_SUBMISSIONS: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "relay_accepted_submissions",
             "Number of accepted submissions"
@@ -149,7 +143,7 @@ register_metrics! {
         &["relay", "optimistic"]
     )
     .unwrap();
-    pub static SIMULATION_THREAD_WORK_TIME: IntCounterVec = IntCounterVec::new(
+    pub static ref SIMULATION_THREAD_WORK_TIME: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "simulation_thread_work_time",
             "Time spent working in simulation thread (mus)"
@@ -157,7 +151,7 @@ register_metrics! {
         &["worker_id"]
     )
     .unwrap();
-    pub static SIMULATION_THREAD_WAIT_TIME: IntCounterVec = IntCounterVec::new(
+    pub static ref SIMULATION_THREAD_WAIT_TIME: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "simulation_thread_wait_time",
             "Time spent waiting for input in simulation thread (mus)"
@@ -165,7 +159,7 @@ register_metrics! {
         &["worker_id"]
     )
     .unwrap();
-    pub static ORDERS_IN_LAST_BUILT_BLOCK_E2E_LAT_MS: HistogramVec = HistogramVec::new(
+    pub static ref ORDERS_IN_LAST_BUILT_BLOCK_E2E_LAT_MS: HistogramVec = HistogramVec::new(
         HistogramOpts::new(
             "orders_in_last_built_block_e2e_lat",
             "For all blocks that are ready for submission to the relay its = min over orders (submission start - order received)"
@@ -175,16 +169,10 @@ register_metrics! {
     )
     .unwrap();
 
-    pub static PROVIDER_REOPEN_COUNTER: IntCounter = IntCounter::new(
-        "provider_reopen_counter", "Counter of provider reopens").unwrap();
-
-    pub static PROVIDER_BAD_REOPEN_COUNTER: IntCounter = IntCounter::new(
-        "provider_bad_reopen_counter", "Counter of provider reopens").unwrap();
-
-    pub static TXFETCHER_TRANSACTION_COUNTER: IntCounter = IntCounter::new(
+    pub static ref TXFETCHER_TRANSACTION_COUNTER: IntCounter = IntCounter::new(
         "txfetcher_transaction_counter", "Counter of transactions fetched by txfetcher service").unwrap();
 
-    pub static TXFETCHER_TRANSACTION_QUERY_TIME: HistogramVec = HistogramVec::new(
+    pub static ref TXFETCHER_TRANSACTION_QUERY_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("txfetcher_transaction_query_time", "Time to retrieve a transaction from the txpool (ms)")
             .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
         &[],
@@ -195,7 +183,7 @@ register_metrics! {
      /////////////////////////////////
 
     /// We decide this at the end of the submission to relays
-    pub static SUBSIDIZED_BLOCK_COUNT: IntCounterVec = IntCounterVec::new(
+    pub static ref SUBSIDIZED_BLOCK_COUNT: IntCounterVec = IntCounterVec::new(
         Opts::new(
             "subsidized_block_count",
             "Subsidized block count"
@@ -206,14 +194,14 @@ register_metrics! {
     /// We decide this at the end of the submission to relays
     /// We expect to see values around .001
     /// We only count subsidized blocks.
-    pub static SUBSIDY_VALUE: HistogramVec = HistogramVec::new(
+    pub static ref SUBSIDY_VALUE: HistogramVec = HistogramVec::new(
             HistogramOpts::new("subsidy_value", "Subsidy value")
                 .buckets(exponential_buckets_range(0.0001, 0.05, 1000)),
         &["kind"],
         )
         .unwrap();
 
-    pub static TOTAL_LANDED_SUBSIDIES_SUM: Counter =
+    pub static ref TOTAL_LANDED_SUBSIDIES_SUM: Counter =
         Counter::new("total_landed_subsidies_sum", "Sum of all total landed subsidies").unwrap();
 }
 
@@ -249,6 +237,10 @@ pub fn inc_failed_block_simulations() {
     BLOCK_SIM_ERRORS.with_label_values(&[]).inc()
 }
 
+pub fn inc_blocks_api_errors() {
+    BLOCK_API_ERRORS.with_label_values(&[]).inc()
+}
+
 pub fn set_current_block(block: u64) {
     CURRENT_BLOCK.set(block as i64);
 }
@@ -276,7 +268,6 @@ pub fn set_ordepool_count(txs: usize, bundles: usize) {
 pub fn add_built_block_metrics(
     build_time: Duration,
     finalize_time: Duration,
-    root_hash_time: Duration,
     txs: usize,
     blobs: usize,
     gas_used: u64,
@@ -297,9 +288,6 @@ pub fn add_built_block_metrics(
     BLOCK_FINALIZE_TIME
         .with_label_values(&[builder_name])
         .observe(finalize_time.as_millis() as f64);
-    BLOCK_ROOT_HASH_TIME
-        .with_label_values(&[builder_name])
-        .observe(root_hash_time.as_millis() as f64);
     BLOCK_BUILT_TXS
         .with_label_values(&[builder_name])
         .observe(txs as f64);
@@ -353,14 +341,6 @@ pub fn add_txfetcher_time_to_query(duration: Duration) {
         .observe(duration.as_millis() as f64);
 
     TXFETCHER_TRANSACTION_COUNTER.inc();
-}
-
-pub fn inc_provider_reopen_counter() {
-    PROVIDER_REOPEN_COUNTER.inc();
-}
-
-pub fn inc_provider_bad_reopen_counter() {
-    PROVIDER_BAD_REOPEN_COUNTER.inc();
 }
 
 pub fn add_sim_thread_utilisation_timings(
@@ -423,6 +403,84 @@ pub fn add_subsidy_value(value: U256, landed: bool) {
     if landed {
         TOTAL_LANDED_SUBSIDIES_SUM.inc_by(value_float);
     }
+}
+
+pub(super) fn register_custom_metrics() {
+    REGISTRY
+        .register(Box::new(BLOCK_FILL_TIME.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_FINALIZE_TIME.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_VALIDATION_TIME.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_BUILT_TXS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_BUILT_GAS_USED.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_BUILT_SIM_GAS_USED.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_BUILT_MGAS_PER_SECOND.clone()))
+        .unwrap();
+    REGISTRY.register(Box::new(CURRENT_BLOCK.clone())).unwrap();
+    REGISTRY.register(Box::new(ORDERPOOL_TXS.clone())).unwrap();
+    REGISTRY
+        .register(Box::new(ORDERPOOL_BUNDLES.clone()))
+        .unwrap();
+    REGISTRY.register(Box::new(RELAY_ERRORS.clone())).unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_SIM_ERRORS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(BLOCK_API_ERRORS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(SIMULATED_FAILED_ORDERS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(SIMULATED_OK_ORDERS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(SIMULATION_GAS_USED.clone()))
+        .unwrap();
+    REGISTRY.register(Box::new(ACTIVE_SLOTS.clone())).unwrap();
+    REGISTRY
+        .register(Box::new(INITIATED_SUBMISSIONS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(RELAY_SUBMIT_TIME.clone()))
+        .unwrap();
+    REGISTRY.register(Box::new(VERSION.clone())).unwrap();
+    REGISTRY
+        .register(Box::new(RELAY_ACCEPTED_SUBMISSIONS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(SIMULATION_THREAD_WORK_TIME.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(SIMULATION_THREAD_WAIT_TIME.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(ORDERS_IN_LAST_BUILT_BLOCK_E2E_LAT_MS.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(SUBSIDIZED_BLOCK_COUNT.clone()))
+        .unwrap();
+    REGISTRY.register(Box::new(SUBSIDY_VALUE.clone())).unwrap();
+    REGISTRY
+        .register(Box::new(TOTAL_LANDED_SUBSIDIES_SUM.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(TXFETCHER_TRANSACTION_COUNTER.clone()))
+        .unwrap();
+    REGISTRY
+        .register(Box::new(TXFETCHER_TRANSACTION_QUERY_TIME.clone()))
+        .unwrap();
 }
 
 pub(super) fn gather_prometheus_metrics() -> String {

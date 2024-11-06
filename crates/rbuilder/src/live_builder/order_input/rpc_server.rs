@@ -4,9 +4,8 @@ use crate::primitives::{
     Bundle, BundleReplacementKey, MempoolTx, Order,
 };
 use alloy_primitives::Address;
-use jsonrpsee::types::ErrorObject;
 use jsonrpsee::{server::Server, RpcModule};
-use reth_primitives::Bytes;
+use reth::primitives::Bytes;
 use serde::Deserialize;
 use std::{
     net::{SocketAddr, SocketAddrV4},
@@ -20,9 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 use uuid::Uuid;
 
-/// Creates a jsonrpsee::server::Server configuring the handling for our RPC calls.
-/// Spawns a task that cancels global_cancel if the RPC stops (it's reasonable to shutdown and restart if we don't get orders!).
-/// @Pending reengineering to modularize rpc, block_subsidy_selector here is a patch.
+/// @Pending reengineering to modularize rpc, block_subsidy_selector here is a patch
 pub async fn start_server_accepting_bundles(
     config: OrderInputConfig,
     results: mpsc::Sender<ReplaceableOrderPoolCommand>,
@@ -90,7 +87,7 @@ pub async fn start_server_accepting_bundles(
                 Err(err) => {
                     warn!(?err, "Failed to parse transaction");
                     // @Metric
-                    return Err(err);
+                    return;
                 }
             };
             let raw_tx_order = RawTx { tx: raw_tx };
@@ -100,15 +97,13 @@ pub async fn start_server_accepting_bundles(
                 Err(err) => {
                     warn!(?err, "Failed to verify transaction");
                     // @Metric
-                    return Err(ErrorObject::owned(-32602, "failed to verify transaction", None::<()>));
+                    return;
                 }
             };
-            let hash = tx.tx_with_blobs.hash();
             let order = Order::Tx(tx);
             let parse_duration = start.elapsed();
             trace!(order = ?order.id(), parse_duration_mus = parse_duration.as_micros(), "Received mempool tx from API");
             send_order(order, &results, timeout).await;
-            Ok(hash)
         }
     })?;
 
@@ -129,8 +124,6 @@ pub async fn start_server_accepting_bundles(
     }))
 }
 
-/// Parses a mev share bundle packet and forwards it to the results.
-/// Here we can have NewShareBundle or CancelShareBundle (identified using a "cancel" field (a little ugly)).
 async fn handle_mev_send_bundle(
     results: mpsc::Sender<ReplaceableOrderPoolCommand>,
     timeout: Duration,
@@ -155,7 +148,7 @@ async fn handle_mev_send_bundle(
     };
     match decode_res {
         RawShareBundleDecodeResult::NewShareBundle(bundle) => {
-            let order = Order::ShareBundle(*bundle);
+            let order = Order::ShareBundle(bundle);
             let parse_duration = start.elapsed();
             let target_block = order.target_block().unwrap_or_default();
             trace!(order = ?order.id(), parse_duration_mus = parse_duration.as_micros(), target_block, "Received share bundle");
@@ -181,7 +174,6 @@ async fn send_order(
     send_command(ReplaceableOrderPoolCommand::Order(order), channel, timeout).await;
 }
 
-/// Eats the errors and traces them.
 async fn send_command(
     command: ReplaceableOrderPoolCommand,
     channel: &mpsc::Sender<ReplaceableOrderPoolCommand>,
@@ -204,7 +196,6 @@ pub struct RawCancelBundle {
     pub signing_address: Address,
 }
 
-/// Parses bundle cancellations a sends CancelBundle to the results.
 async fn handle_cancel_bundle(
     results: mpsc::Sender<ReplaceableOrderPoolCommand>,
     timeout: Duration,

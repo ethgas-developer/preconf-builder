@@ -10,13 +10,13 @@ use crate::{
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, B256};
 use rand::seq::SliceRandom;
-use reth_errors::ProviderError;
+use reth::providers::ProviderFactory;
+use reth_db::database::Database;
+use reth_interfaces::provider::ProviderError;
 use reth_payload_builder::database::CachedReads;
-use reth_provider::{StateProvider, StateProviderFactory};
 use std::{
     cmp::{max, min, Ordering},
     collections::hash_map::Entry,
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, trace};
@@ -66,9 +66,9 @@ pub struct SimulatedResult {
 
 // @Feat replaceable orders
 #[derive(Debug)]
-pub struct SimTree<P> {
+pub struct SimTree<DB> {
     // fields for nonce management
-    nonce_cache: NonceCache<P>,
+    nonce_cache: NonceCache<DB>,
 
     sims: HashMap<SimulationId, SimulatedResult>,
     sims_that_update_one_nonce: HashMap<NonceKey, SimulationId>,
@@ -86,12 +86,9 @@ enum OrderNonceState {
     Ready(Vec<Order>),
 }
 
-impl<P> SimTree<P>
-where
-    P: StateProviderFactory + Clone + 'static,
-{
-    pub fn new(provider: P, parent_block: B256) -> Self {
-        let nonce_cache = NonceCache::new(provider, parent_block);
+impl<DB: Database> SimTree<DB> {
+    pub fn new(provider_factory: ProviderFactory<DB>, parent_block: B256) -> Self {
+        let nonce_cache = NonceCache::new(provider_factory, parent_block);
         Self {
             nonce_cache,
             sims: HashMap::default(),
@@ -307,16 +304,13 @@ where
 /// Non-interactive usage of sim tree that will simply simulate all orders.
 /// `randomize_insertion` is used to debug if sim tree works correctly when orders are inserted in a different order
 /// outputs should be independent of this arg.
-pub fn simulate_all_orders_with_sim_tree<P>(
-    provider: P,
+pub fn simulate_all_orders_with_sim_tree<DB: Database + Clone>(
+    factory: ProviderFactory<DB>,
     ctx: &BlockBuildingContext,
     orders: &[Order],
     randomize_insertion: bool,
-) -> Result<(Vec<SimulatedOrder>, Vec<OrderErr>), CriticalCommitOrderError>
-where
-    P: StateProviderFactory + Clone + 'static,
-{
-    let mut sim_tree = SimTree::new(provider.clone(), ctx.attributes.parent);
+) -> Result<(Vec<SimulatedOrder>, Vec<OrderErr>), CriticalCommitOrderError> {
+    let mut sim_tree = SimTree::new(factory.clone(), ctx.attributes.parent);
 
     let mut orders = orders.to_vec();
     let random_insert_size = max(orders.len() / 20, 1);
@@ -329,8 +323,7 @@ where
     }
 
     let mut sim_errors = Vec::new();
-    let mut state_for_sim =
-        Arc::<dyn StateProvider>::from(provider.history_by_block_hash(ctx.attributes.parent)?);
+    let state_for_sim = factory.history_by_block_hash(ctx.attributes.parent)?;
     let mut cache_reads = Some(CachedReads::default());
     loop {
         // mix new orders into the sim_tree
@@ -352,7 +345,7 @@ where
         let mut sim_results = Vec::new();
         for sim_task in sim_tasks {
             let start_time = Instant::now();
-            let mut block_state = BlockState::new_arc(state_for_sim)
+            let mut block_state = BlockState::new(&state_for_sim)
                 .with_cached_reads(cache_reads.take().unwrap_or_default());
             let sim_result = simulate_order(
                 sim_task.parents.clone(),
@@ -360,8 +353,7 @@ where
                 ctx,
                 &mut block_state,
             )?;
-            let (new_cache_reads, _, provider) = block_state.into_parts();
-            state_for_sim = provider;
+            let (new_cache_reads, _) = block_state.into_parts();
             cache_reads = Some(new_cache_reads);
             match sim_result.result {
                 OrderSimResult::Failed(err) => {
@@ -426,7 +418,7 @@ pub fn simulate_order_using_fork<Tracer: SimulationTracer>(
     parent_orders: Vec<Order>,
     order: Order,
     ctx: &BlockBuildingContext,
-    fork: &mut PartialBlockFork<'_, '_, Tracer>,
+    fork: &mut PartialBlockFork<'_, '_, '_, Tracer>,
 ) -> Result<OrderSimResult, CriticalCommitOrderError> {
     // simulate parents
     let mut prev_order = None;
@@ -460,6 +452,7 @@ pub fn simulate_order_using_fork<Tracer: SimulationTracer>(
                 res.gas_used,
                 res.blob_gas_used,
                 res.paid_kickbacks,
+                order.metadata().avg_bid_price,
             );
             let new_nonces = res.nonces_updated.into_iter().collect::<Vec<_>>();
             Ok(OrderSimResult::Success(

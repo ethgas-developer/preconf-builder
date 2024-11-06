@@ -74,12 +74,11 @@ struct ValidBundleState {
     pub order_id: OrderId,
 }
 
-/// Last state we have for a replaceable ShareBundle.
-/// It updates itself on new orders.
+/// last state seen for a replaceable ShareBundle
 /// On new seq:
-///     Valid upgrades if seq > current.
-///     Cancelled ignores.
-/// On Cancel always ends in Cancelled.
+///     Valid upgrades if seq > current
+///     Cancelled ignores
+/// On Cancel always end in Cancelled
 #[derive(Debug)]
 enum BundleReplacementState {
     /// sequence number
@@ -88,7 +87,7 @@ enum BundleReplacementState {
 }
 
 impl BundleReplacementState {
-    /// returns false if some operation on the sink returned false
+    /// retuns false if some operation on the sink returned false
     fn insert_order(
         &mut self,
         order: Order,
@@ -115,7 +114,7 @@ impl BundleReplacementState {
         }
     }
 
-    /// returns false if some operation on the sink returned false
+    /// retuns false if some operation on the sink returned false
     fn cancel_order(&mut self, sink: &mut Box<dyn OrderSink>) -> bool {
         match self {
             BundleReplacementState::Valid(valid) => {

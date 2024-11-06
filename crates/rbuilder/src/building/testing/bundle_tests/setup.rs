@@ -8,8 +8,8 @@ use crate::{
         BlockState, ExecutionError, ExecutionResult, OrderErr, PartialBlock,
     },
     primitives::{
-        order_builder::OrderBuilder, BundleReplacementData, OrderId, Refund, RefundConfig,
-        SimulatedOrder, TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
+        order_builder::OrderBuilder, BundleReplacementData, Refund, RefundConfig, SimulatedOrder,
+        TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
     },
 };
 use alloy_primitives::{Address, TxHash};
@@ -90,11 +90,6 @@ impl TestSetup {
     pub fn set_inner_bundle_refund_config(&mut self, refund_config: Vec<RefundConfig>) {
         self.order_builder
             .set_inner_bundle_refund_config(refund_config)
-    }
-
-    pub fn set_inner_bundle_original_order_id(&mut self, original_order_id: OrderId) {
-        self.order_builder
-            .set_inner_bundle_original_order_id(original_order_id)
     }
 
     /// Adds a tx that does nothing
@@ -207,7 +202,7 @@ impl TestSetup {
     }
     fn try_commit_order(&mut self) -> eyre::Result<Result<ExecutionResult, ExecutionError>> {
         let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider)
+        let mut block_state = BlockState::new(&state_provider)
             .with_bundle_state(self.bundle_state.take().unwrap_or_default())
             .with_cached_reads(self.cached_reads.take().unwrap_or_default());
 
@@ -224,7 +219,7 @@ impl TestSetup {
             &mut block_state,
         )?;
 
-        let (cached_reads, bundle_state, _) = block_state.into_parts();
+        let (cached_reads, bundle_state) = block_state.into_parts();
         self.cached_reads = Some(cached_reads);
         self.bundle_state = Some(bundle_state);
 
@@ -277,7 +272,7 @@ impl TestSetup {
 
     pub fn current_nonce(&self, named_addr: NamedAddr) -> eyre::Result<u64> {
         let state_provider = self.test_chain.provider_factory().latest()?;
-        let mut block_state = BlockState::new(state_provider)
+        let mut block_state = BlockState::new(&state_provider)
             .with_bundle_state(self.bundle_state.clone().unwrap_or_default())
             .with_cached_reads(self.cached_reads.clone().unwrap_or_default());
 

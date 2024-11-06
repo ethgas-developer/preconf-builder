@@ -1,11 +1,9 @@
 use alloy_primitives::{Address, B256, U256};
-use reth_primitives::{
+use reth::primitives::{
     public_key_to_address, Signature, Transaction, TransactionSigned, TransactionSignedEcRecovered,
 };
 use secp256k1::{Message, SecretKey, SECP256K1};
 
-/// Simple struct to sign txs/messages.
-/// Mainly used to sign payout txs from the builder and to create test data.
 #[derive(Debug, Clone)]
 pub struct Signer {
     pub address: Address,
@@ -22,8 +20,7 @@ impl Signer {
     }
 
     pub fn sign_message(&self, message: B256) -> Result<Signature, secp256k1::Error> {
-        let s = SECP256K1
-            .sign_ecdsa_recoverable(&Message::from_digest_slice(&message[..])?, &self.secret);
+        let s = SECP256K1.sign_ecdsa_recoverable(&Message::from_slice(&message[..])?, &self.secret);
         let (rec_id, data) = s.serialize_compact();
 
         let signature = Signature {
@@ -55,7 +52,7 @@ impl Signer {
 mod test {
     use super::*;
     use alloy_primitives::{address, fixed_bytes};
-    use reth_primitives::{TxEip1559, TxKind as TransactionKind};
+    use reth::primitives::{TransactionKind, TxEip1559};
 
     #[test]
     fn test_sign_transaction() {

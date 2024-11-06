@@ -1,5 +1,7 @@
 # Benchmark results for `${HEAD_SHA_SHORT}`
 
+Full report: __BENCH_URL__
+
 |                |                      |
 | -------------- | -------------------- |
 | Date (UTC)     | ${DATE}              |

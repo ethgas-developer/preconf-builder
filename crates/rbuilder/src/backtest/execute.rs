@@ -5,15 +5,14 @@ use crate::{
         BlockBuildingContext, BundleErr, OrderErr, TransactionErr,
     },
     live_builder::cli::LiveBuilderConfig,
-    primitives::{OrderId, SimulatedOrder},
-    utils::{clean_extradata, Signer},
+    primitives::SimulatedOrder,
+    utils::clean_extradata,
 };
 use ahash::HashSet;
 use alloy_primitives::{Address, U256};
-use reth_chainspec::ChainSpec;
-use reth_db::Database;
+use reth::{primitives::ChainSpec, providers::ProviderFactory};
+use reth_db::{database::Database, DatabaseEnv};
 use reth_payload_builder::database::CachedReads;
-use reth_provider::{DatabaseProviderFactory, HeaderProvider, StateProviderFactory};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -22,13 +21,8 @@ pub struct BacktestBuilderOutput {
     pub orders_included: usize,
     pub builder_name: String,
     pub our_bid_value: U256,
-    #[serde(default)]
-    pub included_orders: Vec<OrderId>,
-    #[serde(default)]
-    pub included_order_profits: Vec<U256>,
 }
 
-/// Result of a backtest simulation usually stored for later comparison
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BlockBacktestValue {
     pub block_number: u64,
@@ -55,17 +49,13 @@ pub struct BacktestBlockInput {
     pub sim_errors: Vec<OrderErr>,
 }
 
-pub fn backtest_prepare_ctx_for_block<P>(
+pub fn backtest_prepare_ctx_for_block<DB: Database + Clone>(
     block_data: BlockData,
-    provider: P,
+    provider_factory: ProviderFactory<DB>,
     chain_spec: Arc<ChainSpec>,
     build_block_lag_ms: i64,
     blocklist: HashSet<Address>,
-    builder_signer: Signer,
-) -> eyre::Result<BacktestBlockInput>
-where
-    P: StateProviderFactory + Clone + 'static,
-{
+) -> eyre::Result<BacktestBlockInput> {
     let orders = block_data
         .available_orders
         .iter()
@@ -78,17 +68,15 @@ where
             Some(order.order.clone())
         })
         .collect::<Vec<_>>();
-    let ctx = BlockBuildingContext::from_onchain_block(
-        block_data.onchain_block,
+    let ctx = BlockBuildingContext::from_block_data(
+        &block_data,
         chain_spec.clone(),
-        None,
         blocklist,
-        builder_signer.address,
-        block_data.winning_bid_trace.proposer_fee_recipient,
-        Some(builder_signer),
+        None,
+        None,
     );
     let (sim_orders, sim_errors) =
-        simulate_all_orders_with_sim_tree(provider.clone(), &ctx, &orders, false)?;
+        simulate_all_orders_with_sim_tree(provider_factory.clone(), &ctx, &orders, false)?;
     Ok(BacktestBlockInput {
         ctx,
         sim_orders,
@@ -97,32 +85,26 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn backtest_simulate_block<P, DB, ConfigType>(
+pub fn backtest_simulate_block<ConfigType: LiveBuilderConfig>(
     block_data: BlockData,
-    provider: P,
+    provider_factory: ProviderFactory<Arc<DatabaseEnv>>,
     chain_spec: Arc<ChainSpec>,
     build_block_lag_ms: i64,
     builders_names: Vec<String>,
     config: &ConfigType,
     blocklist: HashSet<Address>,
     sbundle_mergeabe_signers: &[Address],
-) -> eyre::Result<BlockBacktestValue>
-where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB> + StateProviderFactory + HeaderProvider + Clone + 'static,
-    ConfigType: LiveBuilderConfig,
-{
+) -> eyre::Result<BlockBacktestValue> {
     let BacktestBlockInput {
         ctx,
         sim_orders,
         sim_errors,
     } = backtest_prepare_ctx_for_block(
         block_data.clone(),
-        provider.clone(),
+        provider_factory.clone(),
         chain_spec.clone(),
         build_block_lag_ms,
         blocklist,
-        config.base_config().coinbase_signer()?,
     )?;
 
     let filtered_orders_blocklist_count = sim_errors
@@ -164,7 +146,7 @@ where
             builder_name: building_algorithm_name.clone(),
             sbundle_mergeabe_signers: sbundle_mergeabe_signers.to_vec(),
             sim_orders: &sim_orders,
-            provider: provider.clone(),
+            provider_factory: provider_factory.clone(),
             cached_reads,
         };
 
@@ -175,18 +157,6 @@ where
             orders_included: block.trace.included_orders.len(),
             builder_name: building_algorithm_name,
             our_bid_value: block.trace.bid_value,
-            included_orders: block
-                .trace
-                .included_orders
-                .iter()
-                .map(|o| o.order.id())
-                .collect(),
-            included_order_profits: block
-                .trace
-                .included_orders
-                .iter()
-                .map(|o| o.coinbase_profit)
-                .collect(),
         });
     }
 

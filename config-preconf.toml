@@ -1,0 +1,80 @@
+log_json = false
+log_level = "info,rbuilder=debug"
+
+telemetry_port = 6060
+telemetry_ip = "0.0.0.0"
+
+chain = ""
+reth_datadir = ""
+relay_secret_key = ""
+coinbase_secret_key = ""
+cl_node_url = ["http://localhost:3500"]
+jsonrpc_server_port = 8645
+jsonrpc_server_ip = "0.0.0.0"
+el_node_ipc_path = "/tmp/reth.ipc"
+extra_data = "ETHGas www.ethgas.com"
+
+dry_run = false
+
+ignore_cancellable_orders = true
+
+sbundle_mergeabe_signers = []
+
+# EthGas API domain
+preconf_api_url = ""
+# EthGas WebSocket domain
+# preconf_ws_url = "wss://
+simulation_threads = 1
+#### slot_delta_to_start_block_build_ms ####
+# Delta relative to slot_time at which we start to build blocks.
+# If not set, block build will start after getting header from slot.
+# (previous slot +4s, current slot -8s, can refer to SLOT_PROPOSAL_DURATION)
+# Usually negative since we need to start building BEFORE the slot time. (default: None)
+########################################
+slot_delta_to_start_block_build_ms = -1500
+#### slot_delta_to_start_submits_ms ####
+# Delta relative to slot_time at which we start to submit blocks.
+# Usually negative since we need to start submitting BEFORE the slot time. (default: -8000, example: -5000)
+########################################
+slot_delta_to_start_submits_ms = -1000
+#### min_time_between_block_check_ms ####
+# run_submit_to_relays_job waits at least min_time_between_block_check_ms (default: MIN_TIME_BETWEEN_BLOCK_CHECK = 5ms) between new block polls to avoid 100% CPU usage.
+########################################
+min_time_between_block_check_ms = 100
+
+live_builders = ["preconf-ordering"]
+
+[[relays]]
+name = "custom"
+url = ""
+priority = 0
+use_ssz_for_submit = false
+use_gzip_for_submit = false
+
+[[builders]]
+name = "preconf-ordering"
+algo = "ordering-builder"
+discard_txs = false
+coinbase_payment = false
+sorting = "preconf"
+failed_order_retries = 1
+drop_failed_orders = true
+build_duration_deadline_ms = 1500
+send_value = 100000000000000000
+
+#[[builders]]
+#name = "mgp-ordering"
+#algo = "ordering-builder"
+#discard_txs = true
+#sorting = "mev-gas-price"
+#failed_order_retries = 1
+#drop_failed_orders = true
+#
+#[[builders]]
+#name = "mp-ordering"
+#algo = "ordering-builder"
+#discard_txs = true
+#sorting = "max-profit"
+#failed_order_retries = 1
+#drop_failed_orders = true
+#coinbase_payment = false

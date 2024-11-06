@@ -6,13 +6,9 @@ pub mod payload_source;
 pub mod relay_epoch_cache;
 
 use crate::{
-    beacon_api_client::Client,
-    live_builder::{
-        payload_events::{
-            payload_source::PayloadSourceMuxer,
-            relay_epoch_cache::{RelaysForSlotData, SlotData},
-        },
-        SlotSource,
+    live_builder::payload_events::{
+        payload_source::PayloadSourceMuxer,
+        relay_epoch_cache::{RelaysForSlotData, SlotData},
     },
     primitives::mev_boost::{MevBoostRelay, MevBoostRelayID},
 };
@@ -33,14 +29,11 @@ const NEW_PAYLOAD_RECV_TIMEOUT: Duration = SLOT_DURATION.saturating_mul(2);
 /// One slot (12secs) is enough so we don't saturate any resource and we don't miss to many slots.
 const CONSENSUS_CLIENT_RECONNECT_WAIT: Duration = SLOT_DURATION;
 
-/// Data about a slot received from relays.
-/// Contains the important information needed to build and submit the block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MevBoostSlotData {
-    /// The .data.payload_attributes.suggested_fee_recipient is replaced
     pub payload_attributes_event: PayloadAttributesEvent,
     pub suggested_gas_limit: u64,
-    /// List of relays agreeing to the slot_data. It may not contain all the relays (eg: errors, forks, validators registering only to some relays)
+    /// List of relays that have this slot registered
     pub relays: Vec<MevBoostRelayID>,
     pub slot_data: SlotData,
 }
@@ -73,14 +66,8 @@ impl MevBoostSlotData {
     }
 }
 
-/// Main high level source of MevBoostSlotData to build blocks.
-/// Usage:
-/// - Create one via MevBoostSlotDataGenerator::new.
-/// - Call MevBoostSlotDataGenerator::spawn.
-/// - Poll new slots via the returned UnboundedReceiver on spawn.
-/// - If join with spawned task is needed await on the JoinHandle returned by spawn.
 pub struct MevBoostSlotDataGenerator {
-    cls: Vec<Client>,
+    cl_urls: Vec<String>,
     relays: Vec<MevBoostRelay>,
     blocklist: HashSet<Address>,
 
@@ -89,34 +76,26 @@ pub struct MevBoostSlotDataGenerator {
 
 impl MevBoostSlotDataGenerator {
     pub fn new(
-        cls: Vec<Client>,
+        cl_urls: Vec<String>,
         relays: Vec<MevBoostRelay>,
         blocklist: HashSet<Address>,
         global_cancellation: CancellationToken,
     ) -> Self {
         Self {
-            cls,
+            cl_urls,
             relays,
             blocklist,
             global_cancellation,
         }
     }
 
-    /// Spawns the reader task.
-    /// It reads from a PayloadSourceMuxer, replaces the fee_recipient/gas_limit with the info from the relays and filters duplicates.
-    /// Why the need for replacing fee_recipient?
-    ///     MEV-boost was built on top of eth 2.0.
-    ///     Usually (without MEV-boost) the CL only notifies the EL for the slots it should build (once every 2 months!).
-    ///     When MEV-boost is used, we tell the CL “--always-build-payload” (we are building blocks for ANY validator now!). The CL does
-    ///     it, but even with the event being created for every slot, the fee_recipient we get from MEV-Boost might be different so we should always replace it.
-    ///     Note that with MEV-boost the validator may change the fee_recipient when registering to the Relays.
     pub fn spawn(self) -> (JoinHandle<()>, mpsc::UnboundedReceiver<MevBoostSlotData>) {
         let relays = RelaysForSlotData::new(&self.relays);
 
         let (send, receive) = mpsc::unbounded_channel();
         let handle = tokio::spawn(async move {
             let mut source = PayloadSourceMuxer::new(
-                &self.cls,
+                &self.cl_urls,
                 NEW_PAYLOAD_RECV_TIMEOUT,
                 CONSENSUS_CLIENT_RECONNECT_WAIT,
                 self.global_cancellation.clone(),
@@ -181,13 +160,6 @@ impl MevBoostSlotDataGenerator {
         });
 
         (handle, receive)
-    }
-}
-
-impl SlotSource for MevBoostSlotDataGenerator {
-    fn recv_slot_channel(self) -> mpsc::UnboundedReceiver<MevBoostSlotData> {
-        let (_handle, chan) = self.spawn();
-        chan
     }
 }
 

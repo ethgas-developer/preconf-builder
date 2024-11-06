@@ -1,16 +1,16 @@
 pub mod base_config;
-pub mod block_output;
+pub mod bidding;
 pub mod building;
 pub mod cli;
 pub mod config;
 pub mod order_input;
 pub mod payload_events;
 pub mod simulation;
-pub mod watchdog;
+mod watchdog;
 
 use crate::{
     building::{
-        builders::{BlockBuildingAlgorithm, UnfinishedBlockBuildingSinkFactory},
+        builders::{BlockBuildingAlgorithm, BuilderSinkFactory},
         BlockBuildingContext,
     },
     live_builder::{
@@ -18,25 +18,28 @@ use crate::{
         simulation::OrderSimulationPool,
         watchdog::spawn_watchdog_thread,
     },
+    primitives::mev_boost::MevBoostRelay,
     telemetry::inc_active_slots,
-    utils::{error_storage::spawn_error_storage_writer, Signer},
+    utils::{error_storage::spawn_error_storage_writer, ProviderFactoryReopener, Signer},
 };
 use ahash::HashSet;
 use alloy_primitives::{Address, B256};
+use bidding::BiddingService;
 use building::BlockBuildingPool;
 use eyre::Context;
 use jsonrpsee::RpcModule;
-use payload_events::MevBoostSlotData;
-use reth::{primitives::Header, providers::HeaderProvider};
-use reth_chainspec::ChainSpec;
-use reth_db::Database;
-use reth_provider::{DatabaseProviderFactory, StateProviderFactory};
-use std::fmt::Debug;
+use payload_events::MevBoostSlotDataGenerator;
+use reth::{
+    primitives::{ChainSpec, Header},
+    providers::{HeaderProvider, ProviderFactory},
+};
+use reth_db::database::Database;
 use std::{cmp::min, path::PathBuf, sync::Arc, time::Duration};
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::task::spawn_blocking;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{error, info, warn};
+use crate::preconf::{PreconfConfig};
 
 /// Time the proposer have to propose a block from the beginning of the slot (https://www.paradigm.xyz/2023/04/mev-boost-ethereum-consensus Slot anatomy)
 const SLOT_PROPOSAL_DURATION: std::time::Duration = Duration::from_secs(4);
@@ -46,31 +49,23 @@ const BLOCK_HEADER_DEAD_LINE_DELTA: time::Duration = time::Duration::millisecond
 /// Polling period while trying to get a block header
 const GET_BLOCK_HEADER_PERIOD: time::Duration = time::Duration::milliseconds(250);
 
-/// Trait used to trigger a new block building process in the slot.
-pub trait SlotSource {
-    fn recv_slot_channel(self) -> mpsc::UnboundedReceiver<MevBoostSlotData>;
-}
-
 /// Main builder struct.
 /// Connects to the CL, get the new slots and builds blocks for each slot.
 /// # Usage
 /// Create and run()
 #[derive(Debug)]
-pub struct LiveBuilder<P, DB, BlocksSourceType>
-where
-    DB: Database + Clone + 'static,
-    P: StateProviderFactory + Clone,
-    BlocksSourceType: SlotSource,
-{
+pub struct LiveBuilder<DB, BuilderSinkFactoryType: BuilderSinkFactory> {
+    pub cl_urls: Vec<String>,
+    pub relays: Vec<MevBoostRelay>,
     pub watchdog_timeout: Duration,
-    pub error_storage_path: Option<PathBuf>,
+    pub error_storage_path: PathBuf,
     pub simulation_threads: usize,
     pub order_input_config: OrderInputConfig,
-    pub blocks_source: BlocksSourceType,
-    pub run_sparse_trie_prefetcher: bool,
+    pub preconf_config: PreconfConfig,
+    pub slot_delta_to_start_block_build_ms: Option<time::Duration>,
 
     pub chain_chain_spec: Arc<ChainSpec>,
-    pub provider: P,
+    pub provider_factory: ProviderFactoryReopener<DB>,
 
     pub coinbase_signer: Signer,
     pub extra_data: Vec<u8>,
@@ -78,22 +73,33 @@ where
 
     pub global_cancellation: CancellationToken,
 
-    pub sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
-    pub builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>,
+    pub bidding_service: Box<dyn BiddingService>,
+
+    pub sink_factory: BuilderSinkFactoryType,
+    pub builders: Vec<Arc<dyn BlockBuildingAlgorithm<DB, BuilderSinkFactoryType::SinkType>>>,
     pub extra_rpc: RpcModule<()>,
 }
 
-impl<P, DB, BlocksSourceType: SlotSource> LiveBuilder<P, DB, BlocksSourceType>
+impl<DB: Database + Clone + 'static, BuilderSinkFactoryType: BuilderSinkFactory>
+    LiveBuilder<DB, BuilderSinkFactoryType>
 where
-    DB: Database + Clone + 'static,
-    P: DatabaseProviderFactory<DB> + StateProviderFactory + HeaderProvider + Clone + 'static,
-    BlocksSourceType: SlotSource,
+    <BuilderSinkFactoryType as BuilderSinkFactory>::SinkType: 'static,
 {
+    pub fn with_bidding_service(self, bidding_service: Box<dyn BiddingService>) -> Self {
+        Self {
+            bidding_service,
+            ..self
+        }
+    }
+
     pub fn with_extra_rpc(self, extra_rpc: RpcModule<()>) -> Self {
         Self { extra_rpc, ..self }
     }
 
-    pub fn with_builders(self, builders: Vec<Arc<dyn BlockBuildingAlgorithm<P, DB>>>) -> Self {
+    pub fn with_builders(
+        self,
+        builders: Vec<Arc<dyn BlockBuildingAlgorithm<DB, BuilderSinkFactoryType::SinkType>>>,
+    ) -> Self {
         Self { builders, ..self }
     }
 
@@ -104,42 +110,52 @@ where
             self.coinbase_signer.address
         );
 
-        if let Some(error_storage_path) = self.error_storage_path {
-            spawn_error_storage_writer(error_storage_path, self.global_cancellation.clone())
-                .await
-                .with_context(|| "Error spawning error storage writer")?;
-        }
+        spawn_error_storage_writer(self.error_storage_path, self.global_cancellation.clone())
+            .await
+            .with_context(|| "Error spawning error storage writer")?;
 
         let mut inner_jobs_handles = Vec::new();
-        let mut payload_events_channel = self.blocks_source.recv_slot_channel();
 
-        let orderpool_subscriber = {
-            let (handle, sub) = start_orderpool_jobs(
+        let mut payload_events_channel = {
+            let payload_event = MevBoostSlotDataGenerator::new(
+                self.cl_urls,
+                self.relays.clone(),
+                self.blocklist.clone(),
+                self.global_cancellation.clone(),
+            );
+            let (handle, chan) = payload_event.spawn();
+            inner_jobs_handles.push(handle);
+            chan
+        };
+
+        let (orderpool_subscriber, preconf_info_sender) = {
+            let (handle, sub, sender) = start_orderpool_jobs(
                 self.order_input_config,
-                self.provider.clone(),
+                self.preconf_config,
+                self.provider_factory.clone(),
                 self.extra_rpc,
                 self.global_cancellation.clone(),
             )
             .await?;
             inner_jobs_handles.push(handle);
-            sub
+            (sub, sender)
         };
 
         let order_simulation_pool = {
             OrderSimulationPool::new(
-                self.provider.clone(),
+                self.provider_factory.clone(),
                 self.simulation_threads,
                 self.global_cancellation.clone(),
             )
         };
 
         let mut builder_pool = BlockBuildingPool::new(
-            self.provider.clone(),
+            self.provider_factory.clone(),
             self.builders,
             self.sink_factory,
+            self.bidding_service,
             orderpool_subscriber,
             order_simulation_pool,
-            self.run_sparse_trie_prefetcher,
         );
 
         let watchdog_sender = spawn_watchdog_thread(self.watchdog_timeout)?;
@@ -156,7 +172,7 @@ where
             // see if we can get parent header in a reasonable time
 
             let time_to_slot = payload.timestamp() - OffsetDateTime::now_utc();
-            debug!(
+            info!(
                 slot = payload.slot(),
                 block = payload.block(),
                 ?time_to_slot,
@@ -176,7 +192,8 @@ where
                 // @Nicer
                 let parent_block = payload.parent_block_hash();
                 let timestamp = payload.timestamp();
-                match wait_for_block_header(parent_block, timestamp, &self.provider).await {
+                let provider_factory = self.provider_factory.provider_factory_unchecked();
+                match wait_for_block_header(parent_block, timestamp, &provider_factory).await {
                     Ok(header) => header,
                     Err(err) => {
                         warn!("Failed to get parent header for new slot: {:?}", err);
@@ -185,7 +202,28 @@ where
                 }
             };
 
-            debug!(
+            {
+                let provider_factory = self.provider_factory.clone();
+                let block = payload.block();
+                match spawn_blocking(move || {
+                    provider_factory.check_consistency_and_reopen_if_needed(block)
+                })
+                .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        error!(?err, "Failed to check historical block hashes");
+                        // This error is unrecoverable so we restart.
+                        break;
+                    }
+                    Err(err) => {
+                        error!(?err, "Failed to join historical block hashes task");
+                        continue;
+                    }
+                }
+            }
+
+            info!(
                 slot = payload.slot(),
                 block = payload.block(),
                 "Got header for slot"
@@ -202,6 +240,7 @@ where
                 Some(payload.suggested_gas_limit),
                 self.extra_data.clone(),
                 None,
+                self.slot_delta_to_start_block_build_ms,
             );
 
             builder_pool.start_block_building(
@@ -209,6 +248,7 @@ where
                 block_ctx,
                 self.global_cancellation.clone(),
                 time_until_slot_end.try_into().unwrap_or_default(),
+                preconf_info_sender.clone(),
             );
 
             watchdog_sender.try_send(()).unwrap_or_default();
@@ -227,17 +267,14 @@ where
 }
 
 /// May fail if we wait too much (see [BLOCK_HEADER_DEAD_LINE_DELTA])
-async fn wait_for_block_header<P>(
+async fn wait_for_block_header<DB: Database>(
     block: B256,
     slot_time: OffsetDateTime,
-    provider: P,
-) -> eyre::Result<Header>
-where
-    P: HeaderProvider,
-{
+    provider_factory: &ProviderFactory<DB>,
+) -> eyre::Result<Header> {
     let dead_line = slot_time + BLOCK_HEADER_DEAD_LINE_DELTA;
     while OffsetDateTime::now_utc() < dead_line {
-        if let Some(header) = provider.header(&block)? {
+        if let Some(header) = provider_factory.header(&block)? {
             return Ok(header);
         } else {
             let time_to_sleep = min(

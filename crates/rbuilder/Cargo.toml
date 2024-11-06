@@ -7,15 +7,15 @@ build = "build.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio.workspace = true
+tokio = "1.38.0"
 serde = "1.0.188"
 serde_json = "1.0.105"
 thiserror = "1.0.47"
-eyre.workspace = true
+eyre = "0.6.8"
+ethers = { version = "2.0", features = ["ipc"] }
 reth.workspace = true
 reth-db.workspace = true
-reth-db-common.workspace = true
-reth-errors.workspace = true
+reth-interfaces.workspace = true
 reth-libmdbx.workspace = true
 reth-payload-builder.workspace = true
 reth-basic-payload-builder.workspace = true
@@ -25,37 +25,18 @@ reth-node-api.workspace = true
 reth-node-core.workspace = true
 reth-primitives.workspace = true
 reth-provider.workspace = true
-reth-chainspec.workspace = true
-reth-evm.workspace = true
-reth-evm-ethereum.workspace = true
 revm.workspace = true
-revm-primitives.workspace = true
-revm-inspectors.workspace = true
 
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-chains.workspace = true
 alloy-provider.workspace = true
-alloy-pubsub.workspace = true
 alloy-rpc-types.workspace = true
 alloy-json-rpc.workspace = true
 alloy-transport-http.workspace = true
 alloy-network.workspace = true
 alloy-transport.workspace = true
-alloy-rpc-types-beacon.workspace = true
-alloy-rpc-types-engine.workspace = true
-alloy-rpc-types-eth.workspace = true
-alloy-node-bindings.workspace = true
-alloy-consensus.workspace = true
 alloy-serde.workspace = true
-alloy-signer-local.workspace = true
-alloy-eips.workspace = true
-
-ethereum_ssz_derive.workspace = true
-ethereum_ssz.workspace = true
-
-test_utils = { path = "src/test_utils" }
-metrics_macros = { path = "src/telemetry/metrics_macros" }
 
 reqwest = { version = "0.11.20", features = ["blocking"] }
 serde_with = { version = "3.8.1", features = ["time_0_3"] }
@@ -70,7 +51,7 @@ sqlx = { version = "0.7.1", features = [
     "time",
     "uuid",
 ] }
-tracing.workspace = true
+tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
 csv = "1.2.2"
 zip = "0.6.6"
@@ -81,9 +62,9 @@ bigdecimal = "0.4.1"
 mempool-dumpster = "0.1.1"
 itertools = "0.11.0"
 tokio-stream = "0.1.14"
-clap = { workspace = true, features = ["derive", "env"] }
+clap = { version = "4.4.3", features = ["derive", "env"] }
 priority-queue = "2.0.3"
-secp256k1 = { version = "0.29", features = [
+secp256k1 = { version = "0.27.0", features = [
     "global-context",
     "rand-std",
     "recovery",
@@ -94,16 +75,15 @@ flate2 = "1.0.27"
 mev-share-sse = { git = "https://github.com/paradigmxyz/mev-share-rs", rev = "9eb2b0138ab3202b9eb3af4b19c7b3bf40b0faa8", default-features = false }
 jsonrpsee = { version = "0.20.3", features = ["full"] }
 ssz_rs = { git = "https://github.com/ralexstokes/ssz-rs.git", version = "0.9.0" }
-beacon-api-client = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "cf3c404043230559660810bc0c9d6d5a8498d819" }
-ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "cf3c404043230559660810bc0c9d6d5a8498d819" }
+beacon-api-client = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "0e8809c1eda3f54a78991d7a5987ff42c9195d42" }
+ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "0e8809c1eda3f54a78991d7a5987ff42c9195d42" }
 ssz_rs_derive = { git = "https://github.com/ralexstokes/ssz-rs.git", version = "0.9.0" }
-tokio-util = { workspace = true }
+tokio-util = "0.7.11"
 uuid = { version = "1.6.1", features = ["serde", "v5", "v4"] }
 prometheus = "0.13.4"
 hyper = { version = "1.3.1", features = ["server", "full"] }
 warp = "0.3.7"
 lazy_static = "1.4.0"
-ctor = "0.2"
 toml = "0.8.8"
 ahash = "0.8.6"
 rand = "0.8.5"
@@ -122,23 +102,14 @@ governor = "0.6.3"
 derivative = "2.2.0"
 mockall = "0.12.1"
 shellexpand = "3.1.0"
-async-trait = "0.1.80"
-
-eth-sparse-mpt = { git = "https://github.com/flashbots/eth-sparse-mpt", rev = "5d0da73" }
-crossbeam = "0.8.4"
-parking_lot = "0.12.3"
-dashmap = "6.1.0"
 
 [build-dependencies]
 built = { version = "0.7.1", features = ["git2", "chrono"] }
 
 [dev-dependencies]
 tempfile = "3.8"
-criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.5.1", features = ["html_reports"] }
 
 [[bench]]
 name = "bench_main"
 harness = false
-
-[features]
-redact_sensitive = []

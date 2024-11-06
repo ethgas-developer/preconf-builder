@@ -7,14 +7,18 @@ pub mod orderpool;
 pub mod replaceable_order_sink;
 pub mod rpc_server;
 pub mod txpool_fetcher;
+pub mod preconf_fetcher;
 
 use self::{
     orderpool::{OrderPool, OrderPoolSubscriptionId},
     replaceable_order_sink::ReplaceableOrderSink,
 };
-use crate::primitives::{serialize::CancelShareBundle, BundleReplacementKey, Order};
+use crate::{
+    primitives::{serialize::CancelShareBundle, BundleReplacementKey, Order},
+    utils::ProviderFactoryReopener,
+};
 use jsonrpsee::RpcModule;
-use reth_provider::StateProviderFactory;
+use reth_db::database::Database;
 use std::{
     net::Ipv4Addr,
     path::PathBuf,
@@ -22,15 +26,30 @@ use std::{
     time::Duration,
 };
 use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
-
+use crate::preconf::{PreconfConfig, PreconfInfo};
 use super::base_config::BaseConfig;
 
 /// Thread safe access to OrderPool to get orderflow
 #[derive(Debug)]
 pub struct OrderPoolSubscriber {
     orderpool: Arc<Mutex<OrderPool>>,
+}
+
+/// OrderPoolSubscriptionId that removes on drop
+/// Call add_sink to get flow and remove_sink to stop it
+/// For easy auto remove we have add_sink_auto_remove
+pub struct AutoRemovingOrderPoolSubscriptionId {
+    orderpool: Arc<Mutex<OrderPool>>,
+    id: OrderPoolSubscriptionId,
+}
+
+impl Drop for AutoRemovingOrderPoolSubscriptionId {
+    fn drop(&mut self) {
+        self.orderpool.lock().unwrap().remove_sink(&self.id);
+    }
 }
 
 impl OrderPoolSubscriber {
@@ -62,39 +81,16 @@ impl OrderPoolSubscriber {
     }
 }
 
-/// OrderPoolSubscriptionId that removes on drop.
-/// Call add_sink to get flow and remove_sink to stop it
-/// For easy auto remove we have add_sink_auto_remove
-pub struct AutoRemovingOrderPoolSubscriptionId {
-    orderpool: Arc<Mutex<OrderPool>>,
-    id: OrderPoolSubscriptionId,
-}
-
-impl Drop for AutoRemovingOrderPoolSubscriptionId {
-    fn drop(&mut self) {
-        self.orderpool.lock().unwrap().remove_sink(&self.id);
-    }
-}
-
-/// All the info needed to start all the order related jobs (mempool, rcp, clean)
 #[derive(Debug, Clone)]
 pub struct OrderInputConfig {
-    /// if true - cancellations are disabled.
+    // if none - cancellations are disabled
     ignore_cancellable_orders: bool,
-    /// if true -- txs with blobs are ignored
     ignore_blobs: bool,
-    /// Path to reth ipc
     ipc_path: PathBuf,
-    /// Input RPC port
     server_port: u16,
-    /// Input RPC ip
     server_ip: Ipv4Addr,
-    /// Input RPC max connections
     serve_max_connections: u32,
-    /// All order sources send new ReplaceableOrderPoolCommands through an mpsc::Sender bounded channel.
-    /// Timeout to wait when sending to that channel (after that the ReplaceableOrderPoolCommand is lost).
     results_channel_timeout: Duration,
-    /// Size of the bounded channel.
     input_channel_buffer_size: usize,
 }
 pub const DEFAULT_SERVE_MAX_CONNECTIONS: u32 = 4096;
@@ -123,37 +119,21 @@ impl OrderInputConfig {
             input_channel_buffer_size,
         }
     }
-
-    pub fn from_config(config: &BaseConfig) -> eyre::Result<Self> {
-        let el_node_ipc_path = expand_path(config.el_node_ipc_path.clone())?;
-
-        Ok(OrderInputConfig {
+    pub fn from_config(config: &BaseConfig) -> Self {
+        OrderInputConfig {
             ignore_cancellable_orders: config.ignore_cancellable_orders,
             ignore_blobs: config.ignore_blobs,
-            ipc_path: el_node_ipc_path,
+            ipc_path: config.el_node_ipc_path.clone(),
             server_port: config.jsonrpc_server_port,
             server_ip: config.jsonrpc_server_ip(),
             serve_max_connections: 4096,
             results_channel_timeout: Duration::from_millis(50),
             input_channel_buffer_size: 10_000,
-        })
-    }
-
-    pub fn default_e2e() -> Self {
-        Self {
-            ipc_path: PathBuf::from("/tmp/anvil.ipc"),
-            results_channel_timeout: Duration::new(5, 0),
-            ignore_cancellable_orders: false,
-            ignore_blobs: false,
-            input_channel_buffer_size: 10,
-            serve_max_connections: 4096,
-            server_ip: Ipv4Addr::new(127, 0, 0, 1),
-            server_port: 0,
         }
     }
 }
 
-/// Commands we can get from RPC or mempool fetcher.
+/// Commands we can get from RPC
 #[derive(Debug, Clone)]
 pub enum ReplaceableOrderPoolCommand {
     /// New or update order
@@ -173,25 +153,18 @@ impl ReplaceableOrderPoolCommand {
     }
 }
 
-/// Starts all the tokio tasks to handle order flow:
-/// - Mempool
-/// - RPC
-/// - Clean up task to remove old stuff.
-///
-/// @Pending reengineering to modularize rpc, extra_rpc here is a patch to upgrade the created rpc server.
-pub async fn start_orderpool_jobs<P>(
-    config: OrderInputConfig,
-    provider_factory: P,
+/// @Pending reengineering to modularize rpc, block_subsidy_selector here is a patch
+pub async fn start_orderpool_jobs<DB: Database + Clone + 'static>(
+    order_input_config: OrderInputConfig,
+    preconf_config: PreconfConfig,
+    provider_factory: ProviderFactoryReopener<DB>,
     extra_rpc: RpcModule<()>,
     global_cancel: CancellationToken,
-) -> eyre::Result<(JoinHandle<()>, OrderPoolSubscriber)>
-where
-    P: StateProviderFactory + 'static,
-{
-    if config.ignore_cancellable_orders {
+) -> eyre::Result<(JoinHandle<()>, OrderPoolSubscriber, Sender<PreconfInfo>)> {
+    if order_input_config.ignore_cancellable_orders {
         warn!("ignore_cancellable_orders is set to true, some order input is ignored");
     }
-    if config.ignore_blobs {
+    if order_input_config.ignore_blobs {
         warn!("ignore_blobs is set to true, some order input is ignored");
     }
 
@@ -200,28 +173,35 @@ where
         orderpool: orderpool.clone(),
     };
 
-    let (order_sender, order_receiver) = mpsc::channel(config.input_channel_buffer_size);
+    let (order_sender, order_receiver) = mpsc::channel(order_input_config.input_channel_buffer_size);
 
     let clean_job = clean_orderpool::spawn_clean_orderpool_job(
-        config.clone(),
+        order_input_config.clone(),
         provider_factory,
         orderpool.clone(),
         global_cancel.clone(),
     )
     .await?;
     let rpc_server = rpc_server::start_server_accepting_bundles(
-        config.clone(),
+        order_input_config.clone(),
         order_sender.clone(),
         extra_rpc,
         global_cancel.clone(),
     )
     .await?;
+
     let txpool_fetcher = txpool_fetcher::subscribe_to_txpool_with_blobs(
-        config.clone(),
+        order_input_config.clone(),
         order_sender.clone(),
         global_cancel.clone(),
     )
     .await?;
+
+    let (preconf_fetcher, preconf_info_sender) = preconf_fetcher::subscribe_to_preconf_pool(
+        preconf_config.clone(),
+        order_sender.clone(),
+        global_cancel.clone(),
+    ).await?;
 
     let handle = tokio::spawn(async move {
         info!("OrderPoolJobs: started");
@@ -241,7 +221,7 @@ where
             };
 
             // Ignore orders with cancellations if we can't support them
-            if config.ignore_cancellable_orders {
+            if order_input_config.ignore_cancellable_orders {
                 new_commands.retain(|o| {
                     let cancellable_order = match o {
                         ReplaceableOrderPoolCommand::Order(o) => {
@@ -256,7 +236,7 @@ where
                 })
             }
 
-            if config.ignore_blobs {
+            if order_input_config.ignore_blobs {
                 new_commands.retain(|o| {
                     let has_blobs = match o {
                         ReplaceableOrderPoolCommand::Order(o) => {
@@ -278,7 +258,7 @@ where
             new_commands.clear();
         }
 
-        for handle in [clean_job, rpc_server, txpool_fetcher] {
+        for handle in [clean_job, rpc_server, txpool_fetcher, preconf_fetcher] {
             handle
                 .await
                 .map_err(|err| {
@@ -289,13 +269,5 @@ where
         info!("OrderPoolJobs: finished");
     });
 
-    Ok((handle, subscriber))
-}
-
-pub fn expand_path(path: PathBuf) -> eyre::Result<PathBuf> {
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| eyre::eyre!("Invalid UTF-8 in path"))?;
-
-    Ok(PathBuf::from(shellexpand::full(path_str)?.into_owned()))
+    Ok((handle, subscriber, preconf_info_sender))
 }

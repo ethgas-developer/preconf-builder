@@ -22,13 +22,11 @@ impl PayloadDeliveredResult {
     }
 }
 
-/// Struct that allows to get the delivered payloads for a block from several relays via RPC using [RelayClient]
 #[derive(Debug, Clone)]
 pub struct PayloadDeliveredFetcher {
     relays: HashMap<MevBoostRelayID, RelayClient>,
 }
 
-/// Uses some predefined relays ([RELAYS])
 impl Default for PayloadDeliveredFetcher {
     fn default() -> Self {
         let relays = RELAYS

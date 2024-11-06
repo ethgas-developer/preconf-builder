@@ -6,9 +6,7 @@
 #
 # Based on https://depot.dev/blog/rust-dockerfile-best-practices
 #
-FROM rust:1.81 as base
-
-ARG FEATURES
+FROM rust:1.82 as base
 
 RUN cargo install sccache --version ^0.8
 RUN cargo install cargo-chef --version ^0.1
@@ -41,9 +39,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 #
 FROM base as builder
 WORKDIR /app
-# Default binary filename rbuilder
-# Alternatively can be set to "reth-rbuilder" - to have reth included in the binary
-ARG RBUILDER_BIN="rbuilder"
+
 COPY --from=planner /app/recipe.json recipe.json
 
 RUN --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
@@ -57,15 +53,20 @@ COPY ./crates/ ./crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=$SCCACHE_DIR,sharing=locked \
-    cargo build --release --features="$FEATURES" --bin=${RBUILDER_BIN}
+    cargo build --release
 
 #
 # Runtime container
 #
 FROM gcr.io/distroless/cc-debian12
+
 WORKDIR /app
 
-ARG RBUILDER_BIN="rbuilder"
-COPY --from=builder /app/target/release/${RBUILDER_BIN} /app/rbuilder
+# RUN apk add libssl3 ca-certificates
+# RUN apt-get update \
+#     && apt-get install -y libssl3 ca-certificates \
+#     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/rbuilder /app/rbuilder
 
 ENTRYPOINT ["/app/rbuilder"]

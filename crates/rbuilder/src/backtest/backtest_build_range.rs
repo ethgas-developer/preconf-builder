@@ -1,17 +1,3 @@
-//! Backtest app to build a multiple blocks in a similar way as we do in live.
-//! It gets the orders from a HistoricalDataStorage, simulates the orders and the run the building algorithms.
-//! We count the amount of blocks that generated more profit than the landed block ("won" blocks) and we report:
-//! - Win %: % of blocks "won"
-//! - Total profits: the sum of the profit (= our_true_block_value - landed_bid) for the blocks we won.
-//!   This represents how much extra profit we did compared to the landed blocks.
-//!   Optionally (via --store-backtest) it can store the simulated results on a SQLite db (config.backtest_results_store_path)
-//!   Optionally (via --compare-backtest) it can compare the simulations against previously stored simulations (via --store-backtest)
-//!
-//! Sample call (numbers are from_block , to_block (inclusive)):
-//! - simple backtest: backtest-build-range --config /home/happy_programmer/config.toml 19380913 193809100
-//! - backtest storing simulations : backtest-build-range --config /home/happy_programmer/config.toml --store-backtest 19380913 193809100
-//! - backtest comparing simulations : backtest-build-range --config /home/happy_programmer/config.toml --compare-backtest 19380913 193809100
-
 use crate::{
     backtest::{
         execute::{backtest_simulate_block, BlockBacktestValue},
@@ -19,12 +5,13 @@ use crate::{
     },
     live_builder::{base_config::load_config_toml_and_env, cli::LiveBuilderConfig},
 };
-use alloy_primitives::{utils::format_ether, Address, U256};
+use alloy_primitives::{utils::format_ether, U256};
 use clap::Parser;
 use rayon::prelude::*;
 use std::{
     fs::File,
-    io::{self, Write},
+    io,
+    io::Write,
     path::{Path, PathBuf},
 };
 use time::format_description::well_known::Rfc3339;
@@ -56,16 +43,12 @@ struct Cli {
     compare_backtest: bool,
     #[clap(long, help = "Path to csv file to write output to")]
     csv: Option<PathBuf>,
-    #[clap(long, help = "Ignored signers")]
-    ignored_signers: Vec<Address>,
     #[clap(help = "Blocks")]
     blocks: Vec<u64>,
 }
 
-pub async fn run_backtest_build_range<ConfigType>() -> eyre::Result<()>
-where
-    ConfigType: LiveBuilderConfig,
-{
+pub async fn run_backtest_build_range<ConfigType: LiveBuilderConfig + Send + Sync>(
+) -> eyre::Result<()> {
     let cli = Cli::parse();
 
     if cli.store_backtest && cli.compare_backtest {
@@ -74,7 +57,7 @@ where
         ));
     }
     let config: ConfigType = load_config_toml_and_env(cli.config.clone())?;
-    config.base_config().setup_tracing_subscriber()?;
+    config.base_config().setup_tracing_subsriber()?;
 
     let builders_names = config.base_config().backtest_builders.clone();
 
@@ -111,7 +94,10 @@ where
         result
     };
 
-    let provider_factory = config.base_config().create_provider_factory()?;
+    let provider_factory = config
+        .base_config()
+        .provider_factory()?
+        .provider_factory_unchecked();
     let chain_spec = config.base_config().chain_spec()?;
 
     let mut profits = Vec::new();
@@ -138,7 +124,6 @@ where
     let mut read_blocks = spawn_block_fetcher(
         historical_data_storage,
         blocks.clone(),
-        cli.ignored_signers,
         cancel_token.clone(),
     );
 
@@ -151,7 +136,6 @@ where
         } else {
             break;
         };
-        // process the read blocks to get the BlockBacktestValues
         let input = blocks
             .into_iter()
             .map(|block_data| {
@@ -192,8 +176,6 @@ where
                 },
             )
             .collect::<Vec<_>>();
-
-        // Compare the BlockBacktestValues with the landed block and optionally compare or store
         for o in output {
             if let Some(csv_output) = &mut csv_output {
                 csv_output.write_block_data(&o)?;
@@ -394,13 +376,9 @@ impl CSVResultWriter {
     }
 }
 
-/// Spawns a task that reads BlockData from the HistoricalDataStorage in blocks of current_num_threads.
-/// The results can the be polled from the returned mpsc::Receiver
-/// This allows us to process a batch while the next is being fetched.
 fn spawn_block_fetcher(
     mut historical_data_storage: HistoricalDataStorage,
     blocks: Vec<u64>,
-    ignored_signers: Vec<Address>,
     cancellation_token: CancellationToken,
 ) -> mpsc::Receiver<Vec<BlockData>> {
     let (sender, receiver) = mpsc::channel(10);
@@ -410,16 +388,13 @@ fn spawn_block_fetcher(
             if cancellation_token.is_cancelled() {
                 return;
             }
-            let mut blocks = match historical_data_storage.read_blocks(blocks).await {
+            let blocks = match historical_data_storage.read_blocks(blocks).await {
                 Ok(res) => res,
                 Err(err) => {
                     warn!("Failed to read blocks from storage: {:?}", err);
                     return;
                 }
             };
-            for block in &mut blocks {
-                block.filter_out_ignored_signers(&ignored_signers);
-            }
             match sender.send(blocks).await {
                 Ok(_) => {}
                 Err(err) => {

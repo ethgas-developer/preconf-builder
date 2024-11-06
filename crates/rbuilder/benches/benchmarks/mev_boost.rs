@@ -5,8 +5,7 @@ use primitive_types::H384;
 use rbuilder::mev_boost::{
     rpc::TestDataGenerator, sign_block_for_relay, BLSBlockSigner, DenebSubmitBlockRequest,
 };
-use reth::primitives::{BlobTransactionSidecar, SealedBlock};
-use reth_chainspec::SEPOLIA;
+use reth::primitives::{BlobTransactionSidecar, SealedBlock, SEPOLIA};
 use reth_primitives::SealedHeader;
 use std::{fs, path::PathBuf, sync::Arc};
 
@@ -47,7 +46,7 @@ fn bench_mevboost_sign(c: &mut Criterion) {
     let blob_rlp = fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/blob_data/blob1.txt"),
     )
-    .unwrap();
+        .unwrap();
 
     let blob_rlp = hex::decode(blob_rlp).unwrap();
     let blob = BlobTransactionSidecar::decode(&mut blob_rlp.as_slice()).unwrap();
@@ -76,7 +75,7 @@ fn bench_mevboost_sign(c: &mut Criterion) {
                 H384::default(),
                 U256::default(),
             )
-            .unwrap();
+                .unwrap();
         })
     });
 
@@ -100,7 +99,7 @@ fn bench_mevboost_sign(c: &mut Criterion) {
                 H384::default(),
                 U256::default(),
             )
-            .unwrap();
+                .unwrap();
         })
     });
 

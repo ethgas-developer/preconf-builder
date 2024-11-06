@@ -1,9 +1,9 @@
 use std::{cmp::Ordering, collections::hash_map::Entry};
 
 use ahash::{HashMap, HashSet};
-use alloy_primitives::Address;
+use alloy_primitives::{Address, U256};
 use priority_queue::PriorityQueue;
-
+use tracing::log::{debug};
 use crate::{
     building::Sorting,
     primitives::{AccountNonce, Nonce, OrderId, SimulatedOrder},
@@ -11,10 +11,10 @@ use crate::{
 
 use super::SimulatedOrderSink;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Eq, Hash)]
 pub struct OrderPriority {
     pub order_id: OrderId,
-    pub priority: u128,
+    pub priority_items: Vec<u128>,
 }
 
 impl PartialOrd for OrderPriority {
@@ -25,9 +25,26 @@ impl PartialOrd for OrderPriority {
 
 impl Ord for OrderPriority {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| self.order_id.cmp(&other.order_id))
+        for i in 0..self.priority_items.len() {
+            if self.priority_items[i] != other.priority_items[i] {
+                return self.priority_items[i].cmp(&other.priority_items[i]);
+            }
+        }
+        // Finally, compare order_id if everything is the same
+        self.order_id.cmp(&other.order_id)
+    }
+}
+
+impl PartialEq for OrderPriority {
+    fn eq(&self, other: &Self) -> bool {
+        let mut is_equal = true;
+        for i in 0..self.priority_items.len() {
+            if self.priority_items[i] != other.priority_items[i] {
+                is_equal = false;
+                break;
+            }
+        }
+        is_equal
     }
 }
 
@@ -81,7 +98,7 @@ impl PrioritizedOrderStore {
 
         let order = self
             .remove_poped_order(&id)
-            .expect("order from prio queue not found in block orders");
+            .expect("order from priority queue not found in block orders");
         Some(order)
     }
 
@@ -170,6 +187,10 @@ impl PrioritizedOrderStore {
     pub fn get_all_orders(&self) -> Vec<SimulatedOrder> {
         self.orders.values().cloned().collect()
     }
+
+    pub fn print_priority_queue(&self, tag: &str) {
+        debug!("[{}] current main queue: {:?}", tag, self.main_queue);
+    }
 }
 
 impl SimulatedOrderSink for PrioritizedOrderStore {
@@ -201,13 +222,12 @@ impl SimulatedOrderSink for PrioritizedOrderStore {
             }
         }
         if pending_nonces.is_empty() {
+            let sorting_items: Vec<U256> = self.priority.sorting_value(&sim_order.sim_value);
+            let priority_items: Vec<u128> = sorting_items.iter().map(|x| x.to::<u128>()).collect();
             self.main_queue.push(
                 sim_order.id(),
                 OrderPriority {
-                    priority: self
-                        .priority
-                        .sorting_value(&sim_order.sim_value)
-                        .to::<u128>(),
+                    priority_items,
                     order_id: sim_order.id(),
                 },
             );

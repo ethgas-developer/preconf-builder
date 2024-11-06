@@ -12,52 +12,42 @@ use crate::{
 
 use alloy_primitives::{Address, B256, U256};
 
-use reth::revm::database::StateProviderDatabase;
-use reth_errors::ProviderError;
-use reth_payload_builder::database::CachedReads;
-use reth_primitives::{
-    constants::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK},
-    transaction::FillTxEnv,
-    Receipt, KECCAK_EMPTY,
+use reth::{
+    primitives::{
+        constants::eip4844::{DATA_GAS_PER_BLOB, MAX_DATA_GAS_PER_BLOCK},
+        revm::env::tx_env_with_recovered,
+        Receipt, KECCAK_EMPTY,
+    },
+    providers::StateProviderBox,
+    revm::database::StateProviderDatabase,
 };
-use reth_provider::{StateProvider, StateProviderBox};
+use reth_interfaces::provider::ProviderError;
+use reth_payload_builder::database::CachedReads;
 use revm::{
     db::{states::bundle_state::BundleRetention, BundleState},
     inspector_handle_register,
-    primitives::{db::WrapDatabaseRef, EVMError, Env, ExecutionResult, InvalidTransaction, TxEnv},
+    primitives::{db::WrapDatabaseRef, EVMError, Env, ExecutionResult, InvalidTransaction},
     Database, DatabaseCommit, State,
 };
 
 use crate::building::evm_inspector::{RBuilderEVMInspector, UsedStateTrace};
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Clone)]
-pub struct BlockState {
-    provider: Arc<dyn StateProvider>,
+pub struct BlockState<'a> {
+    provider: &'a StateProviderBox,
     cached_reads: CachedReads,
     bundle_state: Option<BundleState>,
 }
 
-impl BlockState {
-    pub fn new(provider: StateProviderBox) -> Self {
-        Self::new_arc(Arc::from(provider))
-    }
-
-    pub fn new_arc(provider: Arc<dyn StateProvider>) -> Self {
+impl<'a> BlockState<'a> {
+    pub fn new(provider: &'a StateProviderBox) -> Self {
         Self {
             provider,
             cached_reads: CachedReads::default(),
             bundle_state: Some(BundleState::default()),
         }
-    }
-
-    pub fn state_provider(&self) -> &dyn StateProvider {
-        &self.provider
-    }
-
-    pub fn into_provider(self) -> Arc<dyn StateProvider> {
-        self.provider
     }
 
     pub fn with_cached_reads(mut self, cached_reads: CachedReads) -> Self {
@@ -70,19 +60,12 @@ impl BlockState {
         self
     }
 
-    pub fn into_parts(self) -> (CachedReads, BundleState, Arc<dyn StateProvider>) {
-        (self.cached_reads, self.bundle_state.unwrap(), self.provider)
-    }
-
-    pub fn clone_bundle_and_cache(&self) -> (CachedReads, BundleState) {
-        (
-            self.cached_reads.clone(),
-            self.bundle_state.clone().unwrap(),
-        )
+    pub fn into_parts(self) -> (CachedReads, BundleState) {
+        (self.cached_reads, self.bundle_state.unwrap())
     }
 
     pub fn new_db_ref(&mut self) -> BlockStateDBRef<impl Database<Error = ProviderError> + '_> {
-        let state_provider = StateProviderDatabase::new(&self.provider);
+        let state_provider = StateProviderDatabase::new(self.provider);
         let cachedb = WrapDatabaseRef(self.cached_reads.as_db(state_provider));
         let bundle_state = self.bundle_state.take().unwrap();
         let db = State::builder()
@@ -216,7 +199,6 @@ pub struct BundleOk {
     pub paid_kickbacks: Vec<(Address, U256)>,
     /// Only for sbundles we accumulate ShareBundleInner::original_order_id that executed ok.
     /// Its original use is for only one level or orders with original_order_id but if nesting happens the parent order original_order_id goes before its children (pre-order DFS)
-    /// Fully dropped orders (TxRevertBehavior::AllowedExcluded allows it!) are not included.
     pub original_order_ids: Vec<OrderId>,
 }
 
@@ -279,6 +261,8 @@ pub struct OrderOk {
     pub receipts: Vec<Receipt>,
     pub paid_kickbacks: Vec<(Address, U256)>,
     pub used_state_trace: Option<UsedStateTrace>,
+    // preconf related fields
+    pub avg_bid_price: Option<U256>,
 }
 
 #[derive(Error, Debug, Eq, PartialEq)]
@@ -291,10 +275,10 @@ pub enum OrderErr {
     NegativeProfit(U256),
 }
 
-pub struct PartialBlockFork<'a, 'b, Tracer: SimulationTracer> {
+pub struct PartialBlockFork<'a, 'b, 'c, Tracer: SimulationTracer> {
     pub rollbacks: usize,
-    pub state: &'a mut BlockState,
-    pub tracer: Option<&'b mut Tracer>,
+    pub state: &'b mut BlockState<'a>,
+    pub tracer: Option<&'c mut Tracer>,
 }
 
 pub struct PartialBlockRollobackPoint {
@@ -324,15 +308,11 @@ pub enum CriticalCommitOrderError {
     EVM(#[from] EVMError<ProviderError>),
 }
 
-/// For all funcs allow_tx_skip means:
-/// If a tx inside a bundle or sbundle fails with TransactionErr (don't confuse this with reverting which is TransactionOk with !.receipt.success)
-/// and it's configured as allowed to revert (for bundles tx in reverting_tx_hashes, for sbundles: TxRevertBehavior != NotAllowed) we continue the
-/// the execution of the bundle/sbundle.
-impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
+impl<'a, 'b, 'c, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, 'c, Tracer> {
     pub fn with_tracer<NewTracer: SimulationTracer>(
         self,
-        tracer: &'b mut NewTracer,
-    ) -> PartialBlockFork<'a, 'b, NewTracer> {
+        tracer: &'c mut NewTracer,
+    ) -> PartialBlockFork<'a, 'b, 'c, NewTracer> {
         PartialBlockFork {
             rollbacks: self.rollbacks,
             state: self.state,
@@ -396,7 +376,7 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
         }
 
         let mut db = self.state.new_db_ref();
-        let tx = &tx_with_blobs.internal_tx_unsecure();
+        let tx = &tx_with_blobs.tx;
         if ctx.blocklist.contains(&tx.signer())
             || tx
                 .to()
@@ -419,14 +399,10 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
             None => return Ok(Err(TransactionErr::GasLeft)),
         }
 
-        let mut tx_env = TxEnv::default();
-        let tx_signed = tx_with_blobs.internal_tx_unsecure();
-        tx_signed.fill_tx_env(&mut tx_env, tx_signed.signer());
-
         let env = Env {
             cfg: ctx.initialized_cfg.cfg_env.clone(),
             block: ctx.block_env.clone(),
-            tx: tx_env,
+            tx: tx_env_with_recovered(tx),
         };
 
         let used_state_tracer = self.tracer.as_mut().and_then(|t| t.get_used_state_tracer());
@@ -445,10 +421,9 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                 EVMError::Transaction(tx_err) => {
                     return Ok(Err(TransactionErr::InvalidTransaction(tx_err)))
                 }
-                EVMError::Database(_)
-                | EVMError::Header(_)
-                | EVMError::Custom(_)
-                | EVMError::Precompile(_) => return Err(err.into()),
+                EVMError::Database(_) | EVMError::Header(_) | EVMError::Custom(_) => {
+                    return Err(err.into())
+                }
             },
         };
         let mut db_context = evm.into_context();
@@ -557,19 +532,18 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
             original_order_ids: Vec::new(),
         };
         for tx_with_blobs in &bundle.txs {
+            let tx = &tx_with_blobs.tx;
             let result = self.commit_tx(
                 tx_with_blobs,
                 ctx,
                 insert.cumulative_gas_used,
                 gas_reserved,
-                insert.cumulative_blob_gas_used,
+                cumulative_blob_gas_used,
             )?;
             match result {
                 Ok(res) => {
-                    if !res.receipt.success
-                        && !bundle.reverting_tx_hashes.contains(&tx_with_blobs.hash())
-                    {
-                        return Ok(Err(BundleErr::TransactionReverted(tx_with_blobs.hash())));
+                    if !res.receipt.success && !bundle.reverting_tx_hashes.contains(&tx.hash()) {
+                        return Ok(Err(BundleErr::TransactionReverted(tx.hash())));
                     }
 
                     insert.gas_used += res.gas_used;
@@ -582,13 +556,10 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                 }
                 Err(err) => {
                     // if optional transaction, skip
-                    if allow_tx_skip && bundle.reverting_tx_hashes.contains(&tx_with_blobs.hash()) {
+                    if allow_tx_skip && bundle.reverting_tx_hashes.contains(&tx.hash()) {
                         continue;
                     } else {
-                        return Ok(Err(BundleErr::InvalidTransaction(
-                            tx_with_blobs.hash(),
-                            err,
-                        )));
+                        return Ok(Err(BundleErr::InvalidTransaction(tx.hash(), err)));
                     }
                 }
             }
@@ -693,7 +664,7 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                 ctx,
                 insert.cumulative_gas_used,
                 gas_reserved,
-                insert.cumulative_blob_gas_used,
+                cumulative_blob_gas_used,
             )?;
             match res {
                 Ok(res) => {
@@ -708,7 +679,6 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
 
                     insert.gas_used += res.gas_used;
                     insert.cumulative_gas_used = res.cumulative_gas_used;
-                    insert.cumulative_blob_gas_used = res.cumulative_blob_gas_used;
                     insert.txs.push(res.tx);
                     update_nonce_list(&mut insert.nonces_updated, res.nonce_updated);
                     insert.receipts.push(res.receipt);
@@ -789,14 +759,16 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                         ctx,
                         insert.cumulative_gas_used,
                         gas_reserved,
-                        insert.cumulative_blob_gas_used,
+                        cumulative_blob_gas_used,
                     )?;
                     match result {
                         Ok(res) => {
                             if !res.receipt.success {
                                 match sbundle_tx.revert_behavior {
                                     crate::primitives::TxRevertBehavior::NotAllowed => {
-                                        return Ok(Err(BundleErr::TransactionReverted(tx.hash())));
+                                        return Ok(Err(BundleErr::TransactionReverted(
+                                            tx.tx.hash(),
+                                        )));
                                     }
                                     crate::primitives::TxRevertBehavior::AllowedIncluded => {}
                                     crate::primitives::TxRevertBehavior::AllowedExcluded => {
@@ -830,7 +802,7 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                             if allow_tx_skip && sbundle_tx.revert_behavior.can_revert() {
                                 continue;
                             } else {
-                                return Ok(Err(BundleErr::InvalidTransaction(tx.hash(), err)));
+                                return Ok(Err(BundleErr::InvalidTransaction(tx.tx.hash(), err)));
                             }
                         }
                     }
@@ -841,16 +813,13 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                         ctx,
                         insert.cumulative_gas_used,
                         gas_reserved,
-                        insert.cumulative_blob_gas_used,
+                        cumulative_blob_gas_used,
                         allow_tx_skip,
                     )?;
                     match inner_res {
                         Ok(res) => {
                             if let Some(original_order_id) = inner_bundle.original_order_id {
-                                if !res.bundle_ok.txs.is_empty() {
-                                    // We only consider this order executed if something was so we exclude 100% dropped bundles.
-                                    insert.original_order_ids.push(original_order_id);
-                                }
+                                insert.original_order_ids.push(original_order_id);
                             }
                             if res.coinbase_diff_before_payouts > res.total_payouts_promissed
                                 && !refundable_elements.contains_key(&idx)
@@ -1011,11 +980,16 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                 )?;
                 match res {
                     Ok(ok) => {
-                        // Builder does not sign txs in this code path, so allow negative coinbase
-                        // profit.
                         let coinbase_balance_after = self.state.balance(ctx.block_env.coinbase)?;
-                        let coinbase_profit =
-                            coinbase_balance_after.saturating_sub(coinbase_balance_before);
+                        let coinbase_profit = match coinbase_profit(
+                            coinbase_balance_before,
+                            coinbase_balance_after,
+                        ) {
+                            Ok(profit) => profit,
+                            Err(err) => {
+                                return Ok(Err(err));
+                            }
+                        };
                         Ok(Ok(OrderOk {
                             coinbase_profit,
                             gas_used: ok.gas_used,
@@ -1028,6 +1002,7 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                             paid_kickbacks: Vec::new(),
                             used_state_trace: self.get_used_state_trace(),
                             original_order_ids: Vec::new(),
+                            avg_bid_price: None,
                         }))
                     }
                     Err(err) => Ok(Err(err.into())),
@@ -1044,42 +1019,7 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                 )?;
                 match res {
                     Ok(ok) => {
-                        // Builder does not sign txs in this code path, so allow negative coinbase
-                        // profit.
                         let coinbase_balance_after = self.state.balance(ctx.block_env.coinbase)?;
-                        let coinbase_profit =
-                            coinbase_balance_after.saturating_sub(coinbase_balance_before);
-                        Ok(Ok(OrderOk {
-                            coinbase_profit,
-                            gas_used: ok.gas_used,
-                            cumulative_gas_used: ok.cumulative_gas_used,
-                            blob_gas_used: ok.blob_gas_used,
-                            cumulative_blob_gas_used: ok.cumulative_blob_gas_used,
-                            txs: ok.txs,
-                            nonces_updated: ok.nonces_updated,
-                            receipts: ok.receipts,
-                            paid_kickbacks: ok.paid_kickbacks,
-                            used_state_trace: self.get_used_state_trace(),
-                            original_order_ids: ok.original_order_ids,
-                        }))
-                    }
-                    Err(err) => Ok(Err(err.into())),
-                }
-            }
-            Order::ShareBundle(bundle) => {
-                let res = self.commit_share_bundle(
-                    bundle,
-                    ctx,
-                    cumulative_gas_used,
-                    gas_reserved,
-                    cumulative_blob_gas_used,
-                    allow_tx_skip,
-                )?;
-                match res {
-                    Ok(ok) => {
-                        let coinbase_balance_after = self.state.balance(ctx.block_env.coinbase)?;
-                        // Builder does sign txs in this code path, so do not allow negative coinbase
-                        // profit.
                         let coinbase_profit = match coinbase_profit(
                             coinbase_balance_before,
                             coinbase_balance_after,
@@ -1101,6 +1041,46 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
                             paid_kickbacks: ok.paid_kickbacks,
                             used_state_trace: self.get_used_state_trace(),
                             original_order_ids: ok.original_order_ids,
+                            avg_bid_price: bundle.metadata.avg_bid_price,
+                        }))
+                    }
+                    Err(err) => Ok(Err(err.into())),
+                }
+            }
+            Order::ShareBundle(bundle) => {
+                let res = self.commit_share_bundle(
+                    bundle,
+                    ctx,
+                    cumulative_gas_used,
+                    gas_reserved,
+                    cumulative_blob_gas_used,
+                    allow_tx_skip,
+                )?;
+                match res {
+                    Ok(ok) => {
+                        let coinbase_balance_after = self.state.balance(ctx.block_env.coinbase)?;
+                        let coinbase_profit = match coinbase_profit(
+                            coinbase_balance_before,
+                            coinbase_balance_after,
+                        ) {
+                            Ok(profit) => profit,
+                            Err(err) => {
+                                return Ok(Err(err));
+                            }
+                        };
+                        Ok(Ok(OrderOk {
+                            coinbase_profit,
+                            gas_used: ok.gas_used,
+                            cumulative_gas_used: ok.cumulative_gas_used,
+                            blob_gas_used: ok.blob_gas_used,
+                            cumulative_blob_gas_used: ok.cumulative_blob_gas_used,
+                            txs: ok.txs,
+                            nonces_updated: ok.nonces_updated,
+                            receipts: ok.receipts,
+                            paid_kickbacks: ok.paid_kickbacks,
+                            used_state_trace: self.get_used_state_trace(),
+                            original_order_ids: ok.original_order_ids,
+                            avg_bid_price: bundle.metadata.avg_bid_price,
                         }))
                     }
                     Err(err) => Ok(Err(err.into())),
@@ -1110,8 +1090,8 @@ impl<'a, 'b, Tracer: SimulationTracer> PartialBlockFork<'a, 'b, Tracer> {
     }
 }
 
-impl<'a, 'b> PartialBlockFork<'a, 'b, ()> {
-    pub fn new(state: &'a mut BlockState) -> Self {
+impl<'a, 'b, 'c> PartialBlockFork<'a, 'b, 'c, ()> {
+    pub fn new(state: &'b mut BlockState<'a>) -> Self {
         Self {
             rollbacks: 0,
             state,
