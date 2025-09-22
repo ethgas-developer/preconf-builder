@@ -1,5 +1,6 @@
 //! builders is a subprocess that builds a block
 pub mod block_building_helper;
+pub mod block_building_helper_stats_logger;
 pub mod mock_block_building_helper;
 pub mod ordering_builder;
 pub mod parallel_builder;
@@ -7,19 +8,20 @@ pub mod parallel_builder;
 use crate::{
     building::{BlockBuildingContext, BuiltBlockTrace, SimulatedOrderSink},
     live_builder::{
-        payload_events::{InternalPayloadId, MevBoostSlotData},
+        block_output::unfinished_block_processing::UnfinishedBuiltBlocksInput,
+        building::built_block_cache::BuiltBlockCache, payload_events::InternalPayloadId,
         simulation::SimulatedOrderCommand,
     },
+    mev_boost::adjustment::BidAdjustmentData,
     primitives::{AccountNonce, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
     utils::{is_provider_factory_health_error, NonceCache},
 };
 use ahash::HashSet;
-use alloy_eips::eip4844::BlobTransactionSidecar;
+use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, Bytes};
-use block_building_helper::BiddableUnfinishedBlock;
 use reth::primitives::SealedBlock;
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::{
     broadcast,
     broadcast::error::{RecvError, TryRecvError},
@@ -32,13 +34,15 @@ use super::{simulated_order_command_to_sink, OrderPriority, PrioritizedOrderStor
 /// Block we built
 #[derive(Debug, Clone)]
 pub struct Block {
+    pub builder_name: String,
     pub trace: BuiltBlockTrace,
     pub sealed_block: SealedBlock,
     /// Sidecars for the txs included in SealedBlock
-    pub txs_blobs_sidecars: Vec<Arc<BlobTransactionSidecar>>,
+    pub txs_blobs_sidecars: Vec<Arc<BlobTransactionSidecarVariant>>,
     /// The Pectra execution requests for this bid.
     pub execution_requests: Vec<Bytes>,
-    pub builder_name: String,
+    /// Bid adjustment data by fee payer address.
+    pub bid_adjustments: HashMap<Address, BidAdjustmentData>,
 }
 
 #[derive(Debug)]
@@ -46,9 +50,10 @@ pub struct LiveBuilderInput<P> {
     pub provider: P,
     pub ctx: BlockBuildingContext,
     pub input: broadcast::Receiver<SimulatedOrderCommand>,
-    pub sink: Arc<dyn UnfinishedBlockBuildingSink>,
+    pub sink: UnfinishedBuiltBlocksInput,
     pub builder_name: String,
     pub cancel: CancellationToken,
+    pub built_block_cache: Arc<BuiltBlockCache>,
     pub preconf_reserved_gas: u64,
 }
 
@@ -190,22 +195,15 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
     }
 }
 
-/// Output of the BlockBuildingAlgorithm.
-pub trait UnfinishedBlockBuildingSink: std::fmt::Debug + Send + Sync {
-    fn new_block(&self, block: BiddableUnfinishedBlock);
-
-    /// The sink may not like blocks where coinbase is the final fee_recipient (eg: this does not allows us to take profit!).
-    /// Not sure this is the right place for this func. Might move somewhere else.
-    fn can_use_suggested_fee_recipient_as_coinbase(&self) -> bool;
-}
-
 #[derive(Debug)]
 pub struct BlockBuildingAlgorithmInput<P> {
     pub provider: P,
     pub ctx: BlockBuildingContext,
     pub input: broadcast::Receiver<SimulatedOrderCommand>,
     /// output for the blocks
-    pub sink: Arc<dyn UnfinishedBlockBuildingSink>,
+    pub sink: UnfinishedBuiltBlocksInput,
+    /// A cache common to several builders so they can optimize their work looking at other builders blocks.
+    pub built_block_cache: Arc<BuiltBlockCache>,
     pub cancel: CancellationToken,
     pub preconf_reserved_gas: u64,
 }
@@ -219,17 +217,6 @@ where
 {
     fn name(&self) -> String;
     fn build_blocks(&self, input: BlockBuildingAlgorithmInput<P>);
-}
-
-/// Factory used to create UnfinishedBlockBuildingSink for builders.
-pub trait UnfinishedBlockBuildingSinkFactory: Debug + Send + Sync {
-    /// Creates an UnfinishedBlockBuildingSink to receive block for slot_data.
-    /// cancel: If this is signaled the sink should cancel. If any unrecoverable situation is found signal cancel.
-    fn create_sink(
-        &mut self,
-        slot_data: MevBoostSlotData,
-        cancel: CancellationToken,
-    ) -> Arc<dyn UnfinishedBlockBuildingSink>;
 }
 
 /// Basic configuration to run a single block building with a BlockBuildingAlgorithm

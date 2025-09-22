@@ -4,15 +4,15 @@
 use super::{
     base_config::BaseConfig,
     block_output::{
-        bid_observer::{BidObserver, NullBidObserver},
-        bid_value_source::null_bid_value_source::NullBidValueSource,
-        bidding::{
-            interfaces::BiddingService, true_block_value_bidder::TrueBlockValueBiddingService,
-            wallet_balance_watcher::WalletBalanceWatcher,
+        bidding_service_interface::{
+            BidObserver, BiddingService, BiddingService2ScrapedBidsObs, LandedBlockInfo,
+            NullBidObserver,
         },
-        block_sealing_bidder_factory::BlockSealingBidderFactory,
         relay_submit::{OptimisticConfig, RelaySubmitSinkFactory, SubmissionConfig},
+        true_value_bidding_service::NewTrueBlockValueBiddingService,
+        unfinished_block_processing::UnfinishedBuiltBlocksInputFactory,
     },
+    wallet_balance_watcher::WalletBalanceWatcher,
 };
 use crate::{
     preconf::PreconfConfig,
@@ -26,20 +26,19 @@ use crate::{
             BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
         },
         order_priority::{
-            PreconfPriority,
-            OrderLengthThreeMaxProfitPriority, OrderLengthThreeMevGasPricePriority,
-            OrderMaxProfitPriority, OrderMevGasPricePriority, OrderTypePriority,
+            FullProfitInfoGetter, NonMempoolProfitInfoGetter, OrderLengthThreeMaxProfitPriority,
+            OrderLengthThreeMevGasPricePriority, OrderMaxProfitPriority, OrderMevGasPricePriority,
+            OrderTypePriority, ProfitInfoGetter,  PreconfPriority,
         },
-        Sorting,
+        PartialBlockExecutionTracer, Sorting,
     },
     live_builder::{
-        base_config::EnvOrValue, block_output::relay_submit::BuilderSinkFactory,
-        cli::LiveBuilderConfig, payload_events::MevBoostSlotDataGenerator,
+        base_config::EnvOrValue, cli::LiveBuilderConfig, payload_events::MevBoostSlotDataGenerator,
     },
-    mev_boost::{BLSBlockSigner, RelayClient},
+    mev_boost::{bloxroute_grpc, BLSBlockSigner, RelayClient},
     primitives::mev_boost::{
-        MevBoostRelayBidSubmitter, MevBoostRelaySlotInfoProvider, RelayConfig, RelayMode,
-        RelaySubmitConfig,
+        MevBoostRelayBidSubmitter, MevBoostRelayID, MevBoostRelaySlotInfoProvider, RelayConfig,
+        RelayMode, RelaySubmitConfig,
     },
     provider::StateProviderFactory,
     roothash::RootHashContext,
@@ -48,8 +47,9 @@ use crate::{
 use alloy_chains::ChainKind;
 use alloy_primitives::{
     utils::{format_ether, parse_ether},
-    FixedBytes, B256,
+    Address, FixedBytes, B256, U256,
 };
+use bid_scraper::bid_scraper_client::run_nng_subscriber_with_retries;
 use ethereum_consensus::{
     builder::compute_builder_domain, crypto::SecretKey, primitives::Version,
     state_transition::Context as ContextEth,
@@ -64,14 +64,16 @@ use reth_primitives::StaticFileSegment;
 use reth_provider::StaticFileProviderFactory;
 use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
-use std::collections::HashMap;
 use std::{
+    collections::HashMap,
     fmt::Debug,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
+use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use url::Url;
 
@@ -80,6 +82,11 @@ use url::Url;
 pub const WALLET_INIT_HISTORY_SIZE: Duration = Duration::from_secs(60 * 60 * 24);
 /// 1 is easier for debugging.
 pub const DEFAULT_MAX_CONCURRENT_SEALS: u64 = 1;
+
+/// More than 2 blocks. This could happen normally every 1000 blocks approx since there is a 10% chance of non-boost blocks.
+pub const BID_SOURCE_TIMEOUT_SECS: u64 = 28;
+/// Don't want to waste too much time in case i failed to non-boost block.
+pub const BID_SOURCE_WAIT_TIME_SECS: u64 = 2;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(tag = "algo", rename_all = "kebab-case", deny_unknown_fields)]
@@ -107,7 +114,18 @@ pub struct Config {
 
     /// selected builder configurations
     pub builders: Vec<BuilderConfig>,
+
+    /// When the sample bidder (see TrueBlockValueBiddingService) will start bidding.
+    /// Usually a negative number.
+    pub slot_delta_to_start_bidding_ms: Option<i64>,
+    /// Value added to the bids (see TrueBlockValueBiddingService).
+    pub subsidy: Option<String>,
 }
+
+const DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS: i64 = -8000;
+const DEFAULT_REGISTRATION_UPDATE_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_ASK_FOR_FILTERING_VALIDATORS: bool = false;
+const DEFAULT_CAN_IGNORE_GAS_LIMIT: bool = false;
 
 #[serde_as]
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -116,10 +134,10 @@ pub struct L1Config {
     // Relay Submission configuration
     pub relays: Vec<RelayConfig>,
     pub enabled_relays: Vec<String>,
-
-    // Secret key that will be used to sign in ETHGas
+    /// The interval at which validator registrations should be updated.
+    pub registration_update_interval_ms: Option<u64>,
+       // Secret key that will be used to sign in ETHGas
     exchange_secret_key: Option<EnvOrValue<String>>,
-
     /// Secret key that will be used to sign normal submissions to the relay.
     relay_secret_key: Option<EnvOrValue<String>>,
     /// Secret key that will be used to sign optimistic submissions to the relay.
@@ -130,12 +148,14 @@ pub struct L1Config {
     /// Bids above this value will always be submitted in non-optimistic mode.
     pub optimistic_max_bid_value_eth: String,
 
-    ///Name kept singular for backwards compatibility
+    /// Name kept singular for backwards compatibility
     #[serde_as(deserialize_as = "OneOrMany<EnvOrValue<String>>")]
     pub cl_node_url: Vec<EnvOrValue<String>>,
 
     /// Genesis fork version for the chain. If not provided it will be fetched from the beacon client.
     pub genesis_fork_version: Option<String>,
+    /// Where the bids scraper publishes the bids. Example:"tcp://0.0.0.0:5555"
+    pub scraped_bids_publisher_url: Option<String>,
 }
 
 impl Default for L1Config {
@@ -150,6 +170,8 @@ impl Default for L1Config {
             optimistic_max_bid_value_eth: "0.0".to_string(),
             cl_node_url: vec![EnvOrValue::from("http://127.0.0.1:3500")],
             genesis_fork_version: None,
+            scraped_bids_publisher_url: None,
+            registration_update_interval_ms: None,
         }
     }
 }
@@ -201,7 +223,7 @@ impl L1Config {
                     relay_config.name.clone(),
                     submit_config,
                     relay_config.mode == RelayMode::Test,
-                ));
+                )?);
             } else {
                 eyre::bail!(
                     "Relay {} in mode {:?} has no submit config",
@@ -249,12 +271,28 @@ impl L1Config {
                             );
                         }
                     };
-                    let client = RelayClient::from_url(
+                    let mut client = RelayClient::from_url(
                         url,
                         relay_config.authorization_header.clone(),
                         relay_config.builder_id_header.clone(),
                         relay_config.api_token_header.clone(),
+                        relay_config.is_bloxroute,
+                        relay_config.bloxroute_rproxy_regions.clone(),
+                        relay_config
+                            .ask_for_filtering_validators
+                            .unwrap_or(DEFAULT_ASK_FOR_FILTERING_VALIDATORS),
+                        relay_config
+                            .can_ignore_gas_limit
+                            .unwrap_or(DEFAULT_CAN_IGNORE_GAS_LIMIT),
                     );
+                    if let Some(grpc_url) = relay_config.grpc_url.clone() {
+                        let grpc_client = Arc::new(TokioMutex::new(
+                            bloxroute_grpc::types::relay_client::RelayClient::new(
+                                tonic::transport::Endpoint::try_from(grpc_url)?.connect_lazy(),
+                            ),
+                        ));
+                        client = client.with_grpc_client(grpc_client);
+                    }
                     Self::create_relay_sub_objects(
                         relay_config,
                         client,
@@ -322,13 +360,15 @@ impl L1Config {
     }
 
     /// Creates the RelaySubmitSinkFactory and also returns the associated relays (MevBoostRelaySlotInfoProvider).
+    #[allow(clippy::type_complexity)]
     pub fn create_relays_sealed_sink_factory(
         &self,
         chain_spec: Arc<ChainSpec>,
         bid_observer: Box<dyn BidObserver + Send + Sync>,
     ) -> eyre::Result<(
-        Box<dyn BuilderSinkFactory>,
+        RelaySubmitSinkFactory,
         Vec<MevBoostRelaySlotInfoProvider>,
+        ahash::HashMap<MevBoostRelayID, Address>,
     )> {
         let submission_config = self.submission_config(chain_spec, bid_observer)?;
         info!(
@@ -349,11 +389,25 @@ impl L1Config {
             eyre::bail!("No slot info providers provided");
         }
 
-        let sink_factory: Box<dyn BuilderSinkFactory> = Box::new(RelaySubmitSinkFactory::new(
-            submission_config,
-            submitters.clone(),
-        ));
-        Ok((sink_factory, slot_info_providers))
+        let sink_factory = RelaySubmitSinkFactory::new(submission_config, submitters.clone());
+
+        let adjustment_fee_payers = self
+            .relays
+            .iter()
+            .filter_map(|r| {
+                r.adjustment_fee_payer
+                    .map(|fee_payer| (r.name.clone(), fee_payer))
+            })
+            .collect();
+
+        Ok((sink_factory, slot_info_providers, adjustment_fee_payers))
+    }
+
+    pub fn registration_update_interval(&self) -> Duration {
+        Duration::from_millis(
+            self.registration_update_interval_ms
+                .unwrap_or(DEFAULT_REGISTRATION_UPDATE_INTERVAL_MS),
+        )
     }
 }
 
@@ -361,57 +415,54 @@ impl LiveBuilderConfig for Config {
     fn base_config(&self) -> &BaseConfig {
         &self.base_config
     }
+
     async fn new_builder<P>(
         &self,
         provider: P,
         cancellation_token: tokio_util::sync::CancellationToken,
-    ) -> eyre::Result<super::LiveBuilder<P, MevBoostSlotDataGenerator>>
+    ) -> eyre::Result<super::LiveBuilder<P>>
     where
         P: StateProviderFactory + Clone + 'static,
     {
-        let (sink_sealed_factory, relays) = self.l1_config.create_relays_sealed_sink_factory(
-            self.base_config.chain_spec()?,
-            Box::new(NullBidObserver {}),
-        )?;
-
-        let (wallet_balance_watcher, wallet_history) = WalletBalanceWatcher::new(
-            provider.clone(),
-            self.base_config.coinbase_signer()?.address,
-            WALLET_INIT_HISTORY_SIZE,
-        )?;
-        let bidding_service: Box<dyn BiddingService> =
-            Box::new(TrueBlockValueBiddingService::new(&wallet_history));
-
-        let sink_factory = Box::new(BlockSealingBidderFactory::new(
-            bidding_service,
-            sink_sealed_factory,
-            Arc::new(NullBidValueSource {}),
-            wallet_balance_watcher,
-        ));
-
-        let blocklist_provider = self
-            .base_config
-            .blocklist_provider(cancellation_token.clone())
-            .await?;
-        let payload_event = MevBoostSlotDataGenerator::new(
-            self.l1_config.beacon_clients()?,
-            relays,
-            blocklist_provider.clone(),
-            cancellation_token.clone(),
+        let subsidy = self.subsidy.clone();
+        let slot_delta_to_start_bidding_ms = time::Duration::milliseconds(
+            self.slot_delta_to_start_bidding_ms
+                .unwrap_or(DEFAULT_SLOT_DELTA_TO_START_BIDDING_MS),
         );
-        // get preconf config
-        let preconf_config = PreconfConfig::from_config(self);
-        let live_builder = self
-            .base_config
-            .create_builder_with_provider_factory(
-                cancellation_token,
-                sink_factory,
-                payload_event,
-                preconf_config,
-                provider,
-                blocklist_provider,
+
+        let bidding_service = Arc::new(NewTrueBlockValueBiddingService {
+            subsidy: subsidy
+                .as_ref()
+                .map(|s| parse_ether(s))
+                .unwrap_or(Ok(U256::ZERO))?,
+            slot_delta_to_start_bidding: slot_delta_to_start_bidding_ms,
+        });
+
+        let (wallet_balance_watcher, _) =
+            create_wallet_balance_watcher(provider.clone(), &self.base_config).await?;
+
+        let (sink_factory, slot_info_provider, adjustment_fee_payers) =
+            create_sink_factory_and_relays(
+                &self.base_config,
+                &self.l1_config,
+                wallet_balance_watcher,
+                Box::new(NullBidObserver {}),
+                bidding_service,
+                cancellation_token.clone(),
             )
             .await?;
+
+        let live_builder = create_builder_from_sink(
+            &self.base_config,
+            &self.l1_config,
+            provider,
+            sink_factory,
+            slot_info_provider,
+            adjustment_fee_payers,
+            cancellation_token,
+             preconf_config,
+        )
+        .await?;
         let builders = create_builders(self.live_builders()?);
         Ok(live_builder.with_builders(builders))
     }
@@ -420,57 +471,97 @@ impl LiveBuilderConfig for Config {
         rbuilder_version()
     }
 
-    fn build_backtest_block<P>(
+    fn build_backtest_block<
+        P,
+        PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
+    >(
         &self,
         building_algorithm_name: &str,
         input: BacktestSimulateBlockInput<'_, P>,
+        partial_block_execution_tracer: PartialBlockExecutionTracerType,
     ) -> eyre::Result<Block>
     where
         P: StateProviderFactory + Clone + 'static,
     {
         let builder_cfg = self.builder(building_algorithm_name)?;
         match builder_cfg.builder {
-            SpecificBuilderConfig::OrderingBuilder(config) => match config.sorting {
-                Sorting::Preconf => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
+            SpecificBuilderConfig::OrderingBuilder(config) => {
+                if config.ignore_mempool_profit_on_bundles {
+                    build_backtest_block_ordering_builder::<
                         P,
-                        PreconfPriority,
-                    >(config, input)
-                }
-                Sorting::MevGasPrice => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
+                        NonMempoolProfitInfoGetter,
+                        PartialBlockExecutionTracerType,
+                    >(config, input, partial_block_execution_tracer)
+                } else {
+                    build_backtest_block_ordering_builder::<
                         P,
-                        OrderMevGasPricePriority,
-                    >(config, input)
+                        FullProfitInfoGetter,
+                        PartialBlockExecutionTracerType,
+                    >(config, input, partial_block_execution_tracer)
                 }
-                Sorting::MaxProfit => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderMaxProfitPriority,
-                    >(config, input)
-                }
-                Sorting::TypeMaxProfit => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderTypePriority,
-                    >(config, input)
-                }
-                Sorting::LengthThreeMaxProfit => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderLengthThreeMaxProfitPriority,
-                    >(config, input)
-                }
-                Sorting::LengthThreeMevGasPrice => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        OrderLengthThreeMevGasPricePriority,
-                    >(config, input)
-                }
-            },
+            }
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P>(input, config)
             }
+        }
+    }
+}
+
+pub fn build_backtest_block_ordering_builder<
+    P,
+    ProfitInfoGetterType: ProfitInfoGetter + 'static,
+    PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
+>(
+    config: OrderingBuilderConfig,
+    input: BacktestSimulateBlockInput<'_, P>,
+    partial_block_execution_tracer: PartialBlockExecutionTracerType,
+) -> eyre::Result<Block>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    match config.sorting {
+         Sorting::Preconf => {
+                    crate::building::builders::ordering_builder::backtest_simulate_block::<
+                   P,
+                OrderMevGasPricePriority<ProfitInfoGetterType>,
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
+
+                }
+        Sorting::MevGasPrice => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderMevGasPricePriority<ProfitInfoGetterType>,
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
+        }
+        Sorting::MaxProfit => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderMaxProfitPriority<ProfitInfoGetterType>,
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
+        }
+        Sorting::TypeMaxProfit => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderTypePriority<ProfitInfoGetterType>,
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
+        }
+        Sorting::LengthThreeMaxProfit => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderLengthThreeMaxProfitPriority<ProfitInfoGetterType>,
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
+        }
+        Sorting::LengthThreeMevGasPrice => {
+            crate::building::builders::ordering_builder::backtest_simulate_block::<
+                P,
+                OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
+                PartialBlockExecutionTracerType,
+            >(config, input, partial_block_execution_tracer)
         }
     }
 }
@@ -506,8 +597,9 @@ impl Default for Config {
                         sorting: Sorting::MevGasPrice,
                         failed_order_retries: 1,
                         drop_failed_orders: true,
-                        coinbase_payment: false,
                         build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
                 BuilderConfig {
@@ -517,8 +609,53 @@ impl Default for Config {
                         sorting: Sorting::MaxProfit,
                         failed_order_retries: 1,
                         drop_failed_orders: true,
-                        coinbase_payment: false,
                         build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
+                    }),
+                },
+                BuilderConfig {
+                    name: String::from("mp-ordering-deadline"),
+                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                        discard_txs: true,
+                        sorting: Sorting::MaxProfit,
+                        failed_order_retries: 1,
+                        drop_failed_orders: true,
+                        build_duration_deadline_ms: Some(30),
+                        ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
+                    }),
+                },
+                BuilderConfig {
+                    name: String::from("mp-ordering-cb"),
+                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                        discard_txs: true,
+                        sorting: Sorting::MaxProfit,
+                        failed_order_retries: 1,
+                        drop_failed_orders: true,
+                        build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
+                    }),
+                },
+                BuilderConfig {
+                    name: String::from("mgp-ordering-default"),
+                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                        discard_txs: true,
+                        sorting: Sorting::MevGasPrice,
+                        failed_order_retries: 1,
+                        drop_failed_orders: false,
+                        build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
+                    }),
+                },
+                BuilderConfig {
+                    name: String::from("parallel"),
+                    builder: SpecificBuilderConfig::ParallelBuilder(ParallelBuilderConfig {
+                        discard_txs: true,
+                        num_threads: 25,
+                        safe_sorting_only: true,
                     }),
                 },
                 BuilderConfig {
@@ -528,8 +665,9 @@ impl Default for Config {
                         sorting: Sorting::Preconf,
                         failed_order_retries: 1,
                         drop_failed_orders: true,
-                        coinbase_payment: true,
-                        build_duration_deadline_ms: Some(1500),
+                        build_duration_deadline_ms: None,
+                        ignore_mempool_profit_on_bundles: false,
+                        pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
                 BuilderConfig {
@@ -574,6 +712,8 @@ impl Default for Config {
                     }),
                 },
             ],
+            slot_delta_to_start_bidding_ms: None,
+            subsidy: None,
         }
     }
 }
@@ -640,29 +780,47 @@ where
     P: StateProviderFactory + Clone + 'static,
 {
     match cfg.builder {
-        SpecificBuilderConfig::OrderingBuilder(order_cfg) => match order_cfg.sorting {
-            Sorting::Preconf => Arc::new(
-                OrderingBuildingAlgorithm::<PreconfPriority>::new(order_cfg, cfg.name),
-            ),
-            Sorting::MevGasPrice => Arc::new(
-                OrderingBuildingAlgorithm::<OrderMevGasPricePriority>::new(order_cfg, cfg.name),
-            ),
-            Sorting::MaxProfit => Arc::new(
-                OrderingBuildingAlgorithm::<OrderMaxProfitPriority>::new(order_cfg, cfg.name),
-            ),
-            Sorting::TypeMaxProfit => Arc::new(
-                OrderingBuildingAlgorithm::<OrderTypePriority>::new(order_cfg, cfg.name),
-            ),
-            Sorting::LengthThreeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
-                OrderLengthThreeMaxProfitPriority,
-            >::new(order_cfg, cfg.name)),
-            Sorting::LengthThreeMevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
-                OrderLengthThreeMevGasPricePriority,
-            >::new(order_cfg, cfg.name)),
-        },
+        SpecificBuilderConfig::OrderingBuilder(order_cfg) => {
+            if order_cfg.ignore_mempool_profit_on_bundles {
+                create_ordering_builder::<P, NonMempoolProfitInfoGetter>(order_cfg, cfg.name)
+            } else {
+                create_ordering_builder::<P, FullProfitInfoGetter>(order_cfg, cfg.name)
+            }
+        }
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
         }
+    }
+}
+
+fn create_ordering_builder<P, ProfitInfoGetterType: ProfitInfoGetter + 'static>(
+    cfg: OrderingBuilderConfig,
+    name: String,
+) -> Arc<dyn BlockBuildingAlgorithm<P>>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    match cfg.sorting {
+        Sorting::MevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
+            OrderMevGasPricePriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::MaxProfit => Arc::new(OrderingBuildingAlgorithm::<
+            OrderMaxProfitPriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::TypeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
+            OrderTypePriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::LengthThreeMaxProfit => Arc::new(OrderingBuildingAlgorithm::<
+            OrderLengthThreeMaxProfitPriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::LengthThreeMevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
+            OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
+        >::new(cfg, name)),
+        Sorting::Preconf => {
+                    crate::building::builders::ordering_builder::backtest_simulate_block::<
+                        P,
+                        PreconfPriority,
+                    >(config, input),
     }
 }
 
@@ -720,17 +878,24 @@ lazy_static! {
                 name: "flashbots".to_string(),
                 url: "http://k8s-default-boostrel-9f278153f5-947835446.us-east-2.elb.amazonaws.com"
                     .to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
                     use_gzip_for_submit: false,
                     optimistic: false,
                     interval_between_submissions_ms: Some(250),
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                adjustment_fee_payer: None,
+                is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
@@ -738,17 +903,24 @@ lazy_static! {
             RelayConfig {
                 name: "ultrasound-us".to_string(),
                 url: "https://relay-builders-us.ultrasound.money".to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
                     use_gzip_for_submit: true,
                     optimistic: true,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                adjustment_fee_payer: None,
+                is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
@@ -756,17 +928,24 @@ lazy_static! {
             RelayConfig {
                 name: "ultrasound-eu".to_string(),
                 url: "https://relay-builders-eu.ultrasound.money".to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
                     use_gzip_for_submit: true,
                     optimistic: true,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                adjustment_fee_payer: None,
+                is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
@@ -774,22 +953,30 @@ lazy_static! {
             RelayConfig {
                 name: "agnostic".to_string(),
                 url: "https://0xa7ab7a996c8584251c8f925da3170bdfd6ebc75d50f5ddc4050a6fdc77f2a3b5fce2cc750d0865e05d7228af97d69561@agnostic-relay.net".to_string(),
+                grpc_url: None,
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
                     use_ssz_for_submit: true,
                     use_gzip_for_submit: true,
                     optimistic: true,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),                priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                adjustment_fee_payer: None,
+                is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map.insert(
             "playground".to_string(),
             RelayConfig {
                 name: "playground".to_string(),
+                grpc_url: None,
                 url: "http://0xac6e77dfe25ecd6110b8e780608cce0dab71fdd5ebea22a16c0205200f2f8e2e3ad3b71d3499c54ad14d6c21b41a37ae@localhost:5555".to_string(),
                 mode: RelayMode::Full,
                 submit_config: Some(RelaySubmitConfig {
@@ -797,15 +984,111 @@ lazy_static! {
                     use_gzip_for_submit: false,
                     optimistic: false,
                     interval_between_submissions_ms: None,
+                    max_bid_eth: None,
                 }),
                 priority: Some(0),
                 authorization_header: None,
                 builder_id_header: None,
                 api_token_header: None,
+                adjustment_fee_payer: None,
+                is_bloxroute: false,
+                bloxroute_rproxy_regions: Vec::new(),
+                ask_for_filtering_validators: None,
+                can_ignore_gas_limit: None,
             },
         );
         map
     };
+}
+
+pub async fn create_wallet_balance_watcher<P>(
+    provider: P,
+    base_config: &BaseConfig,
+) -> eyre::Result<(WalletBalanceWatcher<P>, Vec<LandedBlockInfo>)>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    let address = base_config.coinbase_signer()?.address;
+    Ok(tokio::task::spawn_blocking(move || {
+        WalletBalanceWatcher::new(provider, address, WALLET_INIT_HISTORY_SIZE)
+    })
+    .await??)
+}
+
+pub async fn create_sink_factory_and_relays<P>(
+    base_config: &BaseConfig,
+    l1_config: &L1Config,
+    wallet_balance_watcher: WalletBalanceWatcher<P>,
+    bid_observer: Box<dyn BidObserver + Send + Sync>,
+    bidding_service: Arc<dyn BiddingService>,
+    cancellation_token: CancellationToken,
+) -> eyre::Result<(
+    UnfinishedBuiltBlocksInputFactory<P>,
+    Vec<MevBoostRelaySlotInfoProvider>,
+    ahash::HashMap<MevBoostRelayID, Address>,
+)>
+where
+    P: StateProviderFactory + Clone + 'static,
+{
+    let (sink_sealed_factory, slot_info_provider, adjustment_fee_payers) =
+        l1_config.create_relays_sealed_sink_factory(base_config.chain_spec()?, bid_observer)?;
+
+    if let Some(scraped_bids_publisher_url) = l1_config.scraped_bids_publisher_url.clone() {
+        // Create a ScrapedBids2BlockBidWithStatsObs that will forward bids from run_nng_subscriber_with_retries to the bidding service.
+        let obs = BiddingService2ScrapedBidsObs::new(bidding_service.clone());
+        tokio::spawn(run_nng_subscriber_with_retries(
+            Arc::new(obs),
+            cancellation_token.clone(),
+            scraped_bids_publisher_url,
+            Duration::from_secs(BID_SOURCE_TIMEOUT_SECS),
+            Duration::from_secs(BID_SOURCE_WAIT_TIME_SECS),
+        ));
+    }
+
+    let sink_factory = UnfinishedBuiltBlocksInputFactory::new(
+        bidding_service,
+        sink_sealed_factory,
+        wallet_balance_watcher,
+        base_config.adjust_finalized_blocks,
+    );
+
+    Ok((sink_factory, slot_info_provider, adjustment_fee_payers))
+}
+
+/// Take the end of the pipeline (sink_factory) + pre-created slot_info_provider and creates an empty builder (it still needs the with_builders to be called)
+pub async fn create_builder_from_sink<P>(
+    base_config: &BaseConfig,
+    l1_config: &L1Config,
+    provider: P,
+    sink_factory: UnfinishedBuiltBlocksInputFactory<P>,
+    slot_info_provider: Vec<MevBoostRelaySlotInfoProvider>,
+    adjustment_fee_payers: ahash::HashMap<MevBoostRelayID, Address>,
+    cancellation_token: CancellationToken,
+) -> eyre::Result<super::LiveBuilder<P>>
+where
+    P: StateProviderFactory,
+{
+    let blocklist_provider = base_config
+        .blocklist_provider(cancellation_token.clone())
+        .await?;
+
+    let payload_event = MevBoostSlotDataGenerator::new(
+        l1_config.beacon_clients()?,
+        slot_info_provider,
+        l1_config.registration_update_interval(),
+        adjustment_fee_payers,
+        blocklist_provider.clone(),
+        cancellation_token.clone(),
+    );
+    base_config
+        .create_builder_with_provider_factory(
+            cancellation_token,
+            sink_factory,
+            payload_event,
+            provider,
+            blocklist_provider,
+        )
+        .await
 }
 
 #[cfg(test)]
@@ -865,8 +1148,8 @@ mod test {
             .contains(&"http://localhost:3500".to_string()));
     }
 
-    #[test]
-    fn test_parse_enabled_relays() {
+    #[tokio::test]
+    async fn test_parse_enabled_relays() {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         p.push("./src/live_builder/testdata/config_with_relay_override.toml");
 

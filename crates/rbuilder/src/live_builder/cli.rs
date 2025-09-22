@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{atomic::AtomicBool, Arc},
+};
 
 use clap::Parser;
 use serde::de::DeserializeOwned;
@@ -8,10 +11,11 @@ use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    building::builders::{BacktestSimulateBlockInput, Block},
-    live_builder::{
-        base_config::load_config_toml_and_env, payload_events::MevBoostSlotDataGenerator,
+    building::{
+        builders::{BacktestSimulateBlockInput, Block},
+        PartialBlockExecutionTracer,
     },
+    live_builder::base_config::load_config_toml_and_env,
     provider::StateProviderFactory,
     telemetry,
     utils::{bls::generate_random_bls_address, build_info::Version},
@@ -55,16 +59,20 @@ pub trait LiveBuilderConfig: Debug + DeserializeOwned + Sync {
         &self,
         provider: P,
         cancellation_token: CancellationToken,
-    ) -> impl std::future::Future<Output = eyre::Result<LiveBuilder<P, MevBoostSlotDataGenerator>>> + Send
+    ) -> impl std::future::Future<Output = eyre::Result<LiveBuilder<P>>> + Send
     where
         P: StateProviderFactory + Clone + 'static;
 
     /// Patch until we have a unified way of backtesting using the exact algorithms we use on the LiveBuilder.
     /// building_algorithm_name will come from the specific configuration.
-    fn build_backtest_block<P>(
+    fn build_backtest_block<
+        P,
+        PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
+    >(
         &self,
         building_algorithm_name: &str,
         input: BacktestSimulateBlockInput<'_, P>,
+        partial_block_execution_tracer: PartialBlockExecutionTracerType,
     ) -> eyre::Result<Block>
     where
         P: StateProviderFactory + Clone + 'static;
@@ -81,7 +89,7 @@ where
         Cli::Run(cli) => cli,
         Cli::Config(cli) => {
             let config: ConfigType = load_config_toml_and_env(cli.config)?;
-            println!("{:#?}", config);
+            println!("{config:#?}");
             return Ok(());
         }
         Cli::Version => {
@@ -98,7 +106,7 @@ where
         }
         Cli::GenBls => {
             let address = generate_random_bls_address();
-            println!("0x{}", address);
+            println!("0x{address}");
             return Ok(());
         }
     };
@@ -106,23 +114,26 @@ where
     let config: ConfigType = load_config_toml_and_env(cli.config)?;
     config.base_config().setup_tracing_subscriber()?;
 
+    let ready_to_build = Arc::new(AtomicBool::new(false));
     // Spawn redacted server that is safe for tdx builders to expose
-    telemetry::servers::redacted::spawn(config.base_config().redacted_telemetry_server_address())
-        .await?;
+    telemetry::servers::redacted::spawn(
+        config.base_config().redacted_telemetry_server_address(),
+        ready_to_build.clone(),
+    )
+    .await?;
 
     // Spawn debug server that exposes detailed operational information
     telemetry::servers::full::spawn(
         config.base_config().full_telemetry_server_address(),
         config.version_for_telemetry(),
-        config.base_config().log_enable_dynamic,
     )
     .await?;
     if config.base_config().ipc_provider.is_some() {
         let provider = config.base_config().create_ipc_provider_factory()?;
-        run_builder(provider, config, on_run).await
+        run_builder(provider, config, on_run, ready_to_build).await
     } else {
         let provider = config.base_config().create_reth_provider_factory(false)?;
-        run_builder(provider, config, on_run).await
+        run_builder(provider, config, on_run, ready_to_build).await
     }
 }
 
@@ -130,6 +141,7 @@ async fn run_builder<P, ConfigType>(
     provider: P,
     config: ConfigType,
     on_run: Option<fn()>,
+    ready_to_build: Arc<AtomicBool>,
 ) -> eyre::Result<()>
 where
     ConfigType: LiveBuilderConfig,
@@ -145,7 +157,7 @@ where
     if let Some(on_run) = on_run {
         on_run();
     }
-    builder.run().await?;
+    builder.run(ready_to_build).await?;
     ctrlc.await.unwrap_or_default();
     Ok(())
 }

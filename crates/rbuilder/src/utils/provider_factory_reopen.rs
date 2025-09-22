@@ -1,24 +1,28 @@
 use crate::{
-    building::builders::mock_block_building_helper::MockRootHasher,
+    building::{builders::mock_block_building_helper::MockRootHasher, ThreadBlockBuildingContext},
     live_builder::simulation::SimulatedOrderCommand,
     provider::{RootHasher, StateProviderFactory},
-    roothash::{calculate_state_root, run_trie_prefetcher, RootHashContext, RootHashError},
+    roothash::{
+        calculate_account_proofs, calculate_state_root, run_trie_prefetcher, RootHashContext,
+        RootHashError,
+    },
     telemetry::{inc_provider_bad_reopen_counter, inc_provider_reopen_counter},
 };
 use alloy_consensus::Header;
 use alloy_eips::BlockNumHash;
-use alloy_primitives::{BlockHash, BlockNumber, B256};
-use eth_sparse_mpt::reth_sparse_trie::SparseTrieSharedCache;
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bytes, B256};
+use eth_sparse_mpt::*;
 use parking_lot::Mutex;
-use reth::providers::{BlockHashReader, ChainSpecProvider, ExecutionOutcome, ProviderFactory};
+use reth::providers::{BlockHashReader, ChainSpecProvider, ProviderFactory};
 use reth_db::DatabaseError;
 use reth_errors::{ProviderError, ProviderResult, RethResult};
 use reth_node_api::{NodePrimitives, NodeTypesWithDB};
 use reth_provider::{
     providers::{ProviderNodeTypes, StaticFileProvider},
     BlockNumReader, BlockReader, DatabaseProviderFactory, HashedPostStateProvider, HeaderProvider,
-    StateCommitmentProvider, StateProviderBox, StaticFileProviderFactory,
+    StateProviderBox, StaticFileProviderFactory,
 };
+use revm::database::BundleState;
 use std::{ops::DerefMut, path::PathBuf, sync::Arc};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -271,11 +275,10 @@ impl<T, HasherType> RootHasherImpl<T, HasherType> {
         provider: T,
         hasher: HasherType,
     ) -> Self {
-        let sparse_trie_shared_cache = if let Some(parent_state_root) = parent_state_root {
-            SparseTrieSharedCache::new_with_parent_hash(parent_state_root)
-        } else {
-            SparseTrieSharedCache::default()
-        };
+        let sparse_trie_shared_cache = SparseTrieSharedCache::new_with_parent_block_data(
+            parent_num_hash.hash,
+            parent_state_root.unwrap_or_default(),
+        );
         Self {
             parent_num_hash,
             provider,
@@ -289,12 +292,7 @@ impl<T, HasherType> RootHasherImpl<T, HasherType> {
 impl<T, HasherType> RootHasher for RootHasherImpl<T, HasherType>
 where
     HasherType: HashedPostStateProvider,
-    T: DatabaseProviderFactory<Provider: BlockReader>
-        + StateCommitmentProvider
-        + Send
-        + Sync
-        + Clone
-        + 'static,
+    T: DatabaseProviderFactory<Provider: BlockReader> + Send + Sync + Clone + 'static,
 {
     fn run_prefetcher(
         &self,
@@ -304,19 +302,44 @@ where
         run_trie_prefetcher(
             self.parent_num_hash,
             self.sparse_trie_shared_cache.clone(),
+            self.config.sparse_mpt_version,
             self.provider.clone(),
             simulated_orders,
             cancel,
         );
     }
 
-    fn state_root(&self, outcome: &ExecutionOutcome) -> Result<B256, RootHashError> {
+    fn account_proofs(
+        &self,
+        outcome: &BundleState,
+        addresses: &utils::HashSet<Address>,
+        local_ctx: &mut ThreadBlockBuildingContext,
+    ) -> Result<utils::HashMap<Address, Vec<Bytes>>, RootHashError> {
+        calculate_account_proofs(
+            self.provider.clone(),
+            self.parent_num_hash,
+            outcome,
+            addresses,
+            &self.sparse_trie_shared_cache,
+            &mut local_ctx.root_hash_calculator,
+            &self.config,
+        )
+    }
+
+    fn state_root(
+        &self,
+        outcome: &BundleState,
+        incremental_change: &[Address],
+        local_ctx: &mut ThreadBlockBuildingContext,
+    ) -> Result<B256, RootHashError> {
         calculate_state_root(
             self.provider.clone(),
             &self.hasher,
             self.parent_num_hash,
             outcome,
-            self.sparse_trie_shared_cache.clone(),
+            incremental_change,
+            &self.sparse_trie_shared_cache,
+            &mut local_ctx.root_hash_calculator,
             &self.config,
         )
     }

@@ -10,12 +10,14 @@ use alloy_primitives::utils::format_ether;
 
 use crate::{
     backtest::{
-        execute::{backtest_prepare_ctx_for_block_from_building_context, BacktestBlockInput},
+        execute::{backtest_prepare_orders_from_building_context, BacktestBlockInput},
         OrdersWithTimestamp,
     },
-    building::{builders::BacktestSimulateBlockInput, BlockBuildingContext},
+    building::{
+        builders::BacktestSimulateBlockInput, BlockBuildingContext, NullPartialBlockExecutionTracer,
+    },
     live_builder::cli::LiveBuilderConfig,
-    primitives::{Order, OrderId, SimulatedOrder},
+    primitives::{order_statistics::OrderStatistics, Order, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
 };
 use clap::Parser;
@@ -37,6 +39,11 @@ pub struct BuildBlockCfg {
         default_value = "mp-ordering"
     )]
     pub builders: Vec<String>,
+    #[clap(
+        long,
+        help = "Traces block building execution (shows all executed orders and txs)"
+    )]
+    pub trace_block_building: bool,
 }
 
 /// Provides all the orders needed to simulate the construction of a block.
@@ -75,7 +82,12 @@ where
     config.base_config().setup_tracing_subscriber()?;
 
     let available_orders = orders_source.available_orders();
+    let mut order_statistics = OrderStatistics::new();
+    for order in &available_orders {
+        order_statistics.add(&order.order);
+    }
     println!("Available orders: {}", available_orders.len());
+    println!("Order statistics: {order_statistics:?}");
 
     if build_block_cfg.show_orders {
         print_order_and_timestamp(&available_orders, orders_source.block_time_as_unix_ms());
@@ -86,10 +98,8 @@ where
     orders_source.print_custom_stats(provider_factory.clone())?;
 
     let ctx = orders_source.create_block_building_context()?;
-    let BacktestBlockInput {
-        ctx, sim_orders, ..
-    } = backtest_prepare_ctx_for_block_from_building_context(
-        ctx,
+    let BacktestBlockInput { sim_orders, .. } = backtest_prepare_orders_from_building_context(
+        ctx.clone(),
         available_orders.clone(),
         provider_factory.clone(),
         &config.base_config().sbundle_mergeable_signers(),
@@ -118,16 +128,25 @@ where
                     sim_orders: &sim_orders,
                     provider: provider_factory.clone(),
                 };
-                let build_res = config.build_backtest_block(builder_name, input);
+                let build_res = if build_block_cfg.trace_block_building {
+                    config.build_backtest_block(
+                    builder_name,
+                    input,
+                    crate::backtest::build_block::full_partial_block_execution_tracer::FullPartialBlockExecutionTracer::new())
+                } else {
+                    config.build_backtest_block(
+                    builder_name,
+                    input,
+                    NullPartialBlockExecutionTracer{})
+                };
                 if let Err(err) = &build_res {
-                    println!("Error building block: {:?}", err);
+                    println!("Error building block: {err:?}");
                     return None;
                 }
                 let block = build_res.ok()?;
                 println!(
-                    "Built block {} with builder: {:?}",
-                    ctx.block(),
-                    builder_name
+                    "Built block {} with builder: {builder_name:?}",
+                    ctx.block()
                 );
                 println!("Builder profit: {}", format_ether(block.trace.bid_value));
                 println!(
@@ -135,16 +154,16 @@ where
                     block.trace.included_orders.len()
                 );
 
-                println!("Used orders:");
+                //println!("Used orders:");
                 for order_result in &block.trace.included_orders {
                     println!(
                         "{:>74} gas: {:>8} profit: {}",
                         order_result.order.id().to_string(),
-                        order_result.gas_used,
+                        order_result.space_used.gas,
                         format_ether(order_result.coinbase_profit),
                     );
                     if let Order::Bundle(_) | Order::ShareBundle(_) = order_result.order {
-                        for tx in &order_result.txs {
+                        for tx in order_result.tx_infos.iter().map(|info| &info.tx) {
                             println!("      ↳ {:?}", tx.hash());
                         }
 
@@ -209,7 +228,7 @@ fn print_simulated_orders(
 ) {
     println!("Simulated orders: ({} total)", sim_orders.len());
     let mut sorted_orders = sim_orders.to_owned();
-    sorted_orders.sort_by_key(|order| order.sim_value.coinbase_profit);
+    sorted_orders.sort_by_key(|order| order.sim_value.full_profit_info().coinbase_profit());
     sorted_orders.reverse();
     for order in sorted_orders {
         let order_timestamp = order_and_timestamp
@@ -223,8 +242,8 @@ fn print_simulated_orders(
             "{:>74} slot_time_ms: {:>8}, gas: {:>8} profit: {}",
             order.order.id().to_string(),
             slot_time_ms,
-            order.sim_value.gas_used,
-            format_ether(order.sim_value.coinbase_profit),
+            order.sim_value.gas_used(),
+            format_ether(order.sim_value.full_profit_info().coinbase_profit()),
         );
     }
     println!();

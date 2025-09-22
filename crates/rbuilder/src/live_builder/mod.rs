@@ -1,5 +1,6 @@
 pub mod base_config;
 pub mod block_list_provider;
+pub mod block_list_provider;
 pub mod block_output;
 pub mod building;
 pub mod cli;
@@ -7,13 +8,11 @@ pub mod config;
 pub mod order_input;
 pub mod payload_events;
 pub mod simulation;
+pub mod wallet_balance_watcher;
 pub mod watchdog;
 
 use crate::{
-    building::{
-        builders::{BlockBuildingAlgorithm, UnfinishedBlockBuildingSinkFactory},
-        BlockBuildingContext,
-    },
+    building::{builders::BlockBuildingAlgorithm, BlockBuildingContext},
     live_builder::{
         order_input::{start_orderpool_jobs, OrderInputConfig},
         simulation::OrderSimulationPool,
@@ -31,18 +30,28 @@ use crate::{
 use alloy_consensus::Header;
 use alloy_primitives::{Address, B256};
 use block_list_provider::BlockListProvider;
+use block_output::unfinished_block_processing::UnfinishedBuiltBlocksInputFactory;
 use building::BlockBuildingPool;
 use eyre::Context;
 use jsonrpsee::RpcModule;
 use order_input::ReplaceableOrderPoolCommand;
-use payload_events::{InternalPayloadId, MevBoostSlotData};
+use payload_events::{InternalPayloadId, MevBoostSlotDataGenerator};
 use reth::transaction_pool::{
     BlobStore, EthPooledTransaction, Pool, TransactionListenerKind, TransactionOrdering,
     TransactionPool, TransactionValidator,
 };
 use reth_chainspec::ChainSpec;
 use reth_primitives::{Recovered, TransactionSigned};
-use std::{cmp::min, fmt::Debug, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    cmp::min,
+    fmt::Debug,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -81,11 +90,6 @@ impl TimingsConfig {
     }
 }
 
-/// Trait used to trigger a new block building process in the slot.
-pub trait SlotSource {
-    fn recv_slot_channel(self) -> mpsc::UnboundedReceiver<MevBoostSlotData>;
-}
-
 /// Max headers sent to the cleaning task before the main loop blocks.
 /// Cleaning task is super fast so it should never lag behind block building, even 1 should be enough, 10 is super safe.
 const CLEAN_TASKS_CHANNEL_SIZE: usize = 10;
@@ -95,17 +99,16 @@ const CLEAN_TASKS_CHANNEL_SIZE: usize = 10;
 /// # Usage
 /// Create and run()
 #[derive(Debug)]
-pub struct LiveBuilder<P, BlocksSourceType>
+pub struct LiveBuilder<P>
 where
     P: StateProviderFactory,
-    BlocksSourceType: SlotSource,
 {
     pub watchdog_timeout: Option<Duration>,
     pub error_storage_path: Option<PathBuf>,
     pub simulation_threads: usize,
     pub order_input_config: OrderInputConfig,
     pub preconf_config: PreconfConfig,
-    pub blocks_source: BlocksSourceType,
+    pub blocks_source: MevBoostSlotDataGenerator,
     pub run_sparse_trie_prefetcher: bool,
 
     pub chain_chain_spec: Arc<ChainSpec>,
@@ -117,7 +120,7 @@ where
 
     pub global_cancellation: CancellationToken,
 
-    pub sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
+    pub unfinished_built_blocks_input_factory: UnfinishedBuiltBlocksInputFactory<P>,
     pub builders: Vec<Arc<dyn BlockBuildingAlgorithm<P>>>,
     pub extra_rpc: RpcModule<()>,
 
@@ -125,12 +128,15 @@ where
     pub orderpool_sender: mpsc::Sender<ReplaceableOrderPoolCommand>,
     pub orderpool_receiver: mpsc::Receiver<ReplaceableOrderPoolCommand>,
     pub sbundle_merger_selected_signers: Arc<Vec<Address>>,
+
+    pub evm_caching_enable: bool,
+    pub faster_finalize: bool,
+    pub simulation_use_random_coinbase: bool,
 }
 
-impl<P, BlocksSourceType: SlotSource> LiveBuilder<P, BlocksSourceType>
+impl<P> LiveBuilder<P>
 where
     P: StateProviderFactory + Clone + 'static,
-    BlocksSourceType: SlotSource,
 {
     pub fn with_extra_rpc(self, extra_rpc: RpcModule<()>) -> Self {
         Self { extra_rpc, ..self }
@@ -140,7 +146,7 @@ where
         Self { builders, ..self }
     }
 
-    pub async fn run(self) -> eyre::Result<()> {
+    pub async fn run(self, ready_to_build: Arc<AtomicBool>) -> eyre::Result<()> {
         info!(
             "Builder initial block list size: {}",
             self.blocklist_provider.get_blocklist()?.len(),
@@ -175,9 +181,9 @@ where
                     self.provider.clone(),
                     self.extra_rpc,
                     self.global_cancellation.clone(),
-                    self.orderpool_sender,
-                    self.orderpool_receiver,
-                    header_receiver,
+                self.orderpool_sender,
+                self.orderpool_receiver,
+                header_receiver,
                 )
                 .await?;
             inner_jobs_handles.push(handle);
@@ -188,6 +194,7 @@ where
             OrderSimulationPool::new(
                 self.provider.clone(),
                 self.simulation_threads,
+                self.simulation_use_random_coinbase,
                 self.global_cancellation.clone(),
             )
         };
@@ -195,7 +202,7 @@ where
         let mut builder_pool = BlockBuildingPool::new(
             self.provider.clone(),
             self.builders,
-            self.sink_factory,
+            self.unfinished_built_blocks_input_factory,
             orderpool_subscriber,
             order_simulation_pool,
             self.run_sparse_trie_prefetcher,
@@ -213,6 +220,7 @@ where
             }
         };
 
+        ready_to_build.store(true, Ordering::Relaxed);
         while let Some(payload) = payload_events_channel.recv().await {
             reset_histogram_metrics();
 
@@ -304,6 +312,13 @@ where
                 None,
                 root_hasher,
                 payload.payload_id,
+                self.evm_caching_enable,
+                self.faster_finalize,
+                payload
+                    .relay_registrations
+                    .iter()
+                    .filter_map(|(_, r)| r.adjustment_fee_payer)
+                    .collect(),
             ) {
                 let curr_info = PreconfInfo {
                     slot: payload.slot(),
@@ -319,16 +334,14 @@ where
                     }
                 };
                 mark_building_started(block_ctx.timestamp());
-                builder_pool
-                    .start_block_building(
-                        payload,
-                        block_ctx,
-                        self.global_cancellation.clone(),
-                        time_until_slot_end.try_into().unwrap_or_default(),
-                        &mut preconf_reserved_receiver,
+                builder_pool.start_block_building(
+                    payload,
+                    block_ctx,
+                    self.global_cancellation.clone(),
+                    time_until_slot_end.try_into().unwrap_or_default(),
+                       &mut preconf_reserved_receiver,
                         &preconf_state_handler,
-                    )
-                    .await;
+                );
                 if let Some(watchdog_sender) = watchdog_sender.as_ref() {
                     watchdog_sender.try_send(()).unwrap_or_default();
                 };

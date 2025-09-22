@@ -2,14 +2,13 @@
 //!
 use crate::{
     preconf::PreconfConfig,
-    building::builders::UnfinishedBlockBuildingSinkFactory,
     live_builder::{order_input::OrderInputConfig, LiveBuilder},
     provider::{
         ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory},
         StateProviderFactory,
     },
     roothash::RootHashContext,
-    telemetry::{setup_reloadable_tracing_subscriber, LoggerConfig},
+    utils::tracing::{setup_tracing_subscriber, LoggerConfig},
     utils::{
         constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
         http_provider, ProviderFactoryReopener, Signer,
@@ -17,7 +16,7 @@ use crate::{
 };
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
-use eth_sparse_mpt::RootHashThreadPool;
+use eth_sparse_mpt::{ETHSpareMPTVersion, RootHashThreadPool};
 use eyre::{eyre, Context};
 use jsonrpsee::RpcModule;
 use reth::chainspec::chain_value_parser;
@@ -47,7 +46,8 @@ use super::{
         BlockListProvider, HttpBlockListProvider, NullBlockListProvider,
         StaticFileBlockListProvider,
     },
-    SlotSource,
+    block_output::unfinished_block_processing::UnfinishedBuiltBlocksInputFactory,
+    payload_events::MevBoostSlotDataGenerator,
 };
 
 /// Prefix for env variables in config
@@ -67,18 +67,14 @@ pub struct BaseConfig {
     pub redacted_telemetry_server_port: u16,
     #[serde(default = "default_ip")]
     pub redacted_telemetry_server_ip: Ipv4Addr,
-    pub log_file_path: Option<String>,
+    pub log_file_path: Ipv4Addr,
     pub log_json: bool,
     log_level: EnvOrValue<String>,
     pub log_color: bool,
-    /// Enables dynamic logging (saving logs to a file)
-    pub log_enable_dynamic: bool,
 
     pub error_storage_path: Option<PathBuf>,
 
     coinbase_secret_key: Option<EnvOrValue<String>>,
-
-    pub flashbots_db: Option<EnvOrValue<String>>,
 
     pub el_node_ipc_path: Option<PathBuf>,
     pub jsonrpc_server_port: u16,
@@ -122,31 +118,42 @@ pub struct BaseConfig {
 
     /// Number of threads used for incoming order simulation
     pub simulation_threads: usize,
+    pub simulation_use_random_coinbase: bool,
 
     /// uses cached sparse trie for root hash
     pub root_hash_use_sparse_trie: bool,
+    /// uses cached sparse trie for root hash
+    pub root_hash_sparse_trie_version: String,
     /// compares result of root hash using sparse trie and reference root hash
     pub root_hash_compare_sparse_trie: bool,
     /// number of threads used for root hash thread pool
     /// if 0 global rayon pool is used
     root_hash_threads: usize,
 
+    /// use pipelined finalization where blocks are "prefinalized" first
+    /// and payment tx is inserted later for faster bidding response time
+    pub adjust_finalized_blocks: bool,
+
     pub watchdog_timeout_sec: Option<u64>,
 
     /// List of `builders` to be used for live building
     pub live_builders: Vec<String>,
 
-    /// Preconf
-    // preconf api
-    pub preconf_api_url: Option<String>,
-
-    // preconf websocket
-    pub preconf_ws_url: Option<String>,
-
-    pub fallback_fee_recipient: Option<String>,
-
     /// Config for IPC state provider
     pub ipc_provider: Option<IpcProviderConfig>,
+
+    pub evm_caching_enable: bool,
+    /// Use experimental code for faster finalize
+    pub faster_finalize: bool,
+
+    /// See [OrderPool::time_to_keep_mempool_txs]
+    pub time_to_keep_mempool_txs_secs: u64,
+
+    // preconf api
+    pub preconf_api_url: Option<String>,
+    // preconf websocket
+    pub preconf_ws_url: Option<String>,
+    pub fallback_fee_recipient: Option<String>,
 
     // backtest config
     backtest_fetch_mempool_data_dir: EnvOrValue<String>,
@@ -164,12 +171,11 @@ pub fn default_ip() -> Ipv4Addr {
 }
 
 /// Loads config from toml file, some values can be loaded from env variables with the following syntax
-/// e.g. flashbots_db = "env:FLASHBOTS_DB"
+/// e.g. coinbase_secret_key = "env:COINBASE_SECRET_KEY"
 ///
 /// variables that can be configured with env values:
 /// - log_level
 /// - coinbase_secret_key
-/// - flashbots_db
 /// - relay_secret_key
 /// - optimistic_relay_secret_key
 /// - backtest_fetch_mempool_data_dir
@@ -196,11 +202,10 @@ impl BaseConfig {
         };
         let config = LoggerConfig {
             env_filter: log_level,
-            file: log_file_path,
             log_json: self.log_json,
             log_color: self.log_color,
         };
-        setup_reloadable_tracing_subscriber(config)?;
+        setup_tracing_subscriber(config)?;
         Ok(())
     }
 
@@ -228,23 +233,22 @@ impl BaseConfig {
     }
 
     /// Allows instantiating a [`LiveBuilder`] with an existing provider factory
-    pub async fn create_builder_with_provider_factory<P, SlotSourceType>(
+    pub async fn create_builder_with_provider_factory<P>(
         &self,
         cancellation_token: tokio_util::sync::CancellationToken,
-        sink_factory: Box<dyn UnfinishedBlockBuildingSinkFactory>,
-        slot_source: SlotSourceType,
+        unfinished_built_blocks_input_factory: UnfinishedBuiltBlocksInputFactory<P>,
+        slot_source: MevBoostSlotDataGenerator,
         preconf_config: PreconfConfig,
         provider: P,
         blocklist_provider: Arc<dyn BlockListProvider>,
-    ) -> eyre::Result<super::LiveBuilder<P, SlotSourceType>>
+    ) -> eyre::Result<super::LiveBuilder<P>>
     where
         P: StateProviderFactory,
-        SlotSourceType: SlotSource,
     {
         let order_input_config = OrderInputConfig::from_config(self)?;
         let (orderpool_sender, orderpool_receiver) =
             mpsc::channel(order_input_config.input_channel_buffer_size);
-        Ok(LiveBuilder::<P, SlotSourceType> {
+        Ok(LiveBuilder::<P> {
             watchdog_timeout: self.watchdog_timeout(),
             error_storage_path: self.error_storage_path.clone(),
             simulation_threads: self.simulation_threads,
@@ -261,7 +265,7 @@ impl BaseConfig {
             global_cancellation: cancellation_token,
 
             extra_rpc: RpcModule::new(()),
-            sink_factory,
+            unfinished_built_blocks_input_factory,
             builders: Vec::new(),
 
             run_sparse_trie_prefetcher: self.root_hash_use_sparse_trie,
@@ -269,6 +273,10 @@ impl BaseConfig {
             orderpool_sender,
             orderpool_receiver,
             sbundle_merger_selected_signers: Arc::new(self.sbundle_mergeable_signers()),
+
+            evm_caching_enable: self.evm_caching_enable,
+            simulation_use_random_coinbase: self.simulation_use_random_coinbase,
+            faster_finalize: self.faster_finalize,
         })
     }
 
@@ -338,10 +346,16 @@ impl BaseConfig {
             eyre::bail!("root_hash_use_sparse_trie=true and root_hash_compare_sparse_trie=false must be set, otherwise node will produce incorrect blocks or confusing error messages. These settings are enforced temporarily because upstream parallel root hash implementation is not correct.")
         }
         let thread_pool = self.root_hash_thread_pool()?;
+        let version = match self.root_hash_sparse_trie_version.as_str() {
+            "v1" => ETHSpareMPTVersion::V1,
+            "v2" => ETHSpareMPTVersion::V2,
+            _ => eyre::bail!("root_hash_sparse_trie_version can be v1 or v2"),
+        };
         Ok(RootHashContext::new(
             self.root_hash_use_sparse_trie,
             self.root_hash_compare_sparse_trie,
             thread_pool,
+            version,
         ))
     }
 
@@ -544,6 +558,7 @@ pub const DEFAULT_RETH_DB_PATH: &str = "/mnt/data/reth";
 /// This will update every 2.4 hours, super reasonable.
 pub const DEFAULT_BLOCKLIST_URL_MAX_AGE_HOURS: u64 = 24;
 pub const DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST: bool = false;
+pub const DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS: u64 = 60;
 
 impl Default for BaseConfig {
     fn default() -> Self {
@@ -555,11 +570,8 @@ impl Default for BaseConfig {
             log_json: false,
             log_level: "info".into(),
             log_color: false,
-            log_file_path: None,
-            log_enable_dynamic: false,
             error_storage_path: None,
             coinbase_secret_key: None,
-            flashbots_db: None,
             el_node_ipc_path: None,
             jsonrpc_server_port: DEFAULT_INCOMING_BUNDLES_PORT,
             jsonrpc_server_ip: default_ip(),
@@ -575,8 +587,10 @@ impl Default for BaseConfig {
             blocklist_url_max_age_secs: None,
             extra_data: b"extra_data_change_me".to_vec(),
             root_hash_use_sparse_trie: false,
+            root_hash_sparse_trie_version: "v1".to_string(),
             root_hash_compare_sparse_trie: false,
             root_hash_threads: 0,
+            adjust_finalized_blocks: false,
             watchdog_timeout_sec: None,
             backtest_fetch_mempool_data_dir: "/mnt/data/mempool".into(),
             backtest_fetch_eth_rpc_url: "http://127.0.0.1:8545".to_string(),
@@ -587,10 +601,14 @@ impl Default for BaseConfig {
             backtest_builders: Vec::new(),
             live_builders: vec!["mgp-ordering".to_string(), "mp-ordering".to_string()],
             simulation_threads: 1,
+            simulation_use_random_coinbase: true,
             sbundle_mergeable_signers: None,
             sbundle_mergeabe_signers: None,
             require_non_empty_blocklist: Some(DEFAULT_REQUIRE_NON_EMPTY_BLOCKLIST),
             ipc_provider: None,
+            evm_caching_enable: false,
+            faster_finalize: false,
+            time_to_keep_mempool_txs_secs: DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS,
             preconf_api_url: None,
             preconf_ws_url: None,
             fallback_fee_recipient: None,
@@ -724,7 +742,7 @@ mod test {
         // Setup and initialize a temp reth db (with static files)
         let tempdir = TempDir::with_prefix_in("rbuilder-", "/tmp").unwrap();
 
-        let data_dir = MaybePlatformPath::<DataDirPath>::from(tempdir.into_path());
+        let data_dir = MaybePlatformPath::<DataDirPath>::from(tempdir.keep());
         let data_dir = data_dir.unwrap_or_chain_default(Chain::mainnet(), DatadirArgs::default());
 
         let db = Arc::new(init_db(data_dir.data_dir(), Default::default()).unwrap());

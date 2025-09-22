@@ -2,12 +2,16 @@ use crate::mev_boost::{
     submission::SubmitBlockRequestWithMetadata, RelayClient, RelayError, SubmitBlockErr,
     ValidatorSlotData,
 };
+use alloy_primitives::{utils::parse_ether, Address, U256};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use serde::{Deserialize, Deserializer};
 use std::{env, sync::Arc, time::Duration};
 
 /// Usually human readable id for relays. Not used on anything on any protocol just to identify the relays.
 pub type MevBoostRelayID = String;
+
+/// Timeout for requesting current epoch data from the MEV-Boost relay.
+pub const MEV_BOOST_SLOT_INFO_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Modes for a relay since we may use them for different purposes.
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -46,6 +50,8 @@ impl RelayMode {
 pub struct RelayConfig {
     pub name: String,
     pub url: String,
+    #[serde(default)]
+    pub grpc_url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_env_var")]
     pub authorization_header: Option<String>,
     #[serde(default, deserialize_with = "deserialize_env_var")]
@@ -55,12 +61,27 @@ pub struct RelayConfig {
     /// mode defines the need of submit_config
     #[serde(default)]
     pub mode: RelayMode,
+    /// Bid adjustment fee payer address.
+    pub adjustment_fee_payer: Option<Address>,
     #[serde(flatten)]
     /// Submit specific info.
     /// Used only for Full and Fake mode.
     pub submit_config: Option<RelaySubmitConfig>,
     /// Deprecated field that is not used
     pub priority: Option<usize>,
+    /// Set to `true` for bloxroute relays.
+    #[serde(default)]
+    pub is_bloxroute: bool,
+    /// The list of bloxroute rproxy regions to send to order by preference.
+    #[serde(default)]
+    pub bloxroute_rproxy_regions: Vec<String>,
+    /// Adds "filtering=true" as query to the call relay/v1/builder/validators to get all validators (including those filtering OFAC)
+    /// On 2025/06/24 (my birthday!) only supported by ultrasound.
+    /// None -> false
+    pub ask_for_filtering_validators: Option<bool>,
+    /// If we submit a block with a different gas than the one the validator registered with in this relay the relay does not mind.
+    /// None -> false
+    pub can_ignore_gas_limit: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -75,6 +96,9 @@ pub struct RelaySubmitConfig {
     pub optimistic: bool,
     #[serde(default)]
     pub interval_between_submissions_ms: Option<u64>,
+    /// Max bid we can submit to this relay. Any bid above this will be skipped.
+    /// None -> No limit.
+    pub max_bid_eth: Option<String>,
 }
 
 impl RelayConfig {
@@ -112,6 +136,9 @@ pub struct MevBoostRelayBidSubmitter {
     test_relay: bool,
     /// Parameter for the relay
     cancellations: bool,
+    /// Max bid we can submit to this relay. Any bid above this will be skipped.
+    /// None -> No limit.
+    max_bid: Option<U256>,
 }
 
 impl MevBoostRelayBidSubmitter {
@@ -120,13 +147,19 @@ impl MevBoostRelayBidSubmitter {
         id: String,
         config: &RelaySubmitConfig,
         test_relay: bool,
-    ) -> Self {
+    ) -> eyre::Result<Self> {
+        let max_bid = config
+            .max_bid_eth
+            .as_ref()
+            .map(|s| parse_ether(s))
+            .transpose()
+            .map_err(|e| eyre::eyre!("Failed to parse max bid: {}", e))?;
         let submission_rate_limiter = config.interval_between_submissions_ms.map(|d| {
             Arc::new(RateLimiter::direct(
                 Quota::with_period(Duration::from_millis(d)).expect("Rate limiter time period"),
             ))
         });
-        Self {
+        Ok(Self {
             id,
             client,
             use_ssz_for_submit: config.use_ssz_for_submit,
@@ -135,7 +168,8 @@ impl MevBoostRelayBidSubmitter {
             submission_rate_limiter,
             test_relay,
             cancellations: true,
-        }
+            max_bid,
+        })
     }
 
     pub fn test_relay(&self) -> bool {
@@ -150,6 +184,10 @@ impl MevBoostRelayBidSubmitter {
         self.optimistic
     }
 
+    pub fn max_bid(&self) -> Option<U256> {
+        self.max_bid
+    }
+
     /// false -> rate limiter don't allow
     pub fn can_submit_bid(&self) -> bool {
         if let Some(limiter) = &self.submission_rate_limiter {
@@ -162,10 +200,12 @@ impl MevBoostRelayBidSubmitter {
     pub async fn submit_block(
         &self,
         data: &SubmitBlockRequestWithMetadata,
+        registration: &ValidatorSlotData,
     ) -> Result<(), SubmitBlockErr> {
         self.client
             .submit_block(
                 data,
+                registration,
                 self.use_ssz_for_submit,
                 self.use_gzip_for_submit,
                 self.test_relay,
@@ -185,6 +225,15 @@ pub struct MevBoostRelaySlotInfoProvider {
 
 impl MevBoostRelaySlotInfoProvider {
     pub fn new(client: RelayClient, id: String) -> Self {
+        // we use separate request client for requesting validator data from the relay
+        // 1. it separates TCP connections that are used for submissions and other requests to the relay
+        // 2. it adds request timeout to epoch data request and its not needed for submissions
+        let req_client = reqwest::ClientBuilder::new()
+            .timeout(MEV_BOOST_SLOT_INFO_REQUEST_TIMEOUT)
+            .build()
+            .expect("failed to create reqwest client");
+        let client = client.with_reqwest_client(req_client);
+
         Self { client, id }
     }
     pub fn id(&self) -> &MevBoostRelayID {
@@ -198,6 +247,10 @@ impl MevBoostRelaySlotInfoProvider {
 
     pub async fn get_current_epoch_validators(&self) -> Result<Vec<ValidatorSlotData>, RelayError> {
         self.client.get_current_epoch_validators().await
+    }
+
+    pub fn can_ignore_gas_limit(&self) -> bool {
+        self.client.can_ignore_gas_limit()
     }
 }
 

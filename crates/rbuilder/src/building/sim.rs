@@ -1,11 +1,15 @@
 use super::{
+    create_sim_value,
     tracers::{AccumulatorSimulationTracer, SimulationTracer},
     OrderErr, PartialBlockFork, ThreadBlockBuildingContext,
 };
 use crate::{
-    utils::failed_txs_writer,
-    building::{BlockBuildingContext, BlockState, CriticalCommitOrderError},
-    primitives::{Order, OrderId, SimValue, SimulatedOrder},
+    building::{
+        BlockBuildingContext, BlockBuildingSpaceState, BlockState, CriticalCommitOrderError,
+        NullPartialBlockForkExecutionTracer,
+    },
+    live_builder::order_input::mempool_txs_detector::MempoolTxsDetector,
+    primitives::{Order, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
     telemetry::{add_order_simulation_time, mark_order_pending_nonce},
     utils::NonceCache,
@@ -24,6 +28,7 @@ use std::{
 use tracing::{debug, error, trace};
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum OrderSimResult {
     Success(SimulatedOrder, Vec<(Address, u64)>),
     Failed(OrderErr),
@@ -257,9 +262,16 @@ impl SimTree {
                             .expect("we never delete sims")
                             .simulated_order
                             .sim_value
-                            .coinbase_profit
+                            .full_profit_info()
+                            .coinbase_profit()
                     };
-                    if result.simulated_order.sim_value.coinbase_profit > current_sim_profit {
+                    if result
+                        .simulated_order
+                        .sim_value
+                        .full_profit_info()
+                        .coinbase_profit()
+                        > current_sim_profit
+                    {
                         entry.insert(result.id);
                     }
                 }
@@ -451,7 +463,8 @@ pub fn simulate_order(
     let mut tracer = AccumulatorSimulationTracer::new();
     let mut fork = PartialBlockFork::new(state, ctx, local_ctx).with_tracer(&mut tracer);
     let rollback_point = fork.rollback_point();
-    let sim_res = simulate_order_using_fork(parent_orders, order, &mut fork);
+    let sim_res =
+        simulate_order_using_fork(parent_orders, order, &mut fork, &ctx.mempool_tx_detector);
     fork.rollback(rollback_point);
     let sim_res = sim_res?;
     Ok(OrderSimResultWithGas {
@@ -464,18 +477,20 @@ pub fn simulate_order(
 pub fn simulate_order_using_fork<Tracer: SimulationTracer>(
     parent_orders: Vec<Order>,
     order: Order,
-    fork: &mut PartialBlockFork<'_, '_, '_, '_, Tracer>,
+    fork: &mut PartialBlockFork<'_, '_, '_, '_, Tracer, NullPartialBlockForkExecutionTracer>,
+    mempool_tx_detector: &MempoolTxsDetector,
 ) -> Result<OrderSimResult, CriticalCommitOrderError> {
     let start = Instant::now();
     // simulate parents
-    let mut gas_used = 0;
-    let mut blob_gas_used = 0;
+    let mut space_state = BlockBuildingSpaceState::ZERO;
+    // We use empty combined refunds because the value of the bundle will
+    // not change from batching.
+    let combined_refunds = std::collections::HashMap::default();
     for parent in parent_orders {
-        let result = fork.commit_order(&parent, gas_used, 0, blob_gas_used, true)?;
+        let result = fork.commit_order(&parent, space_state, true, &combined_refunds)?;
         match result {
             Ok(res) => {
-                gas_used += res.gas_used;
-                blob_gas_used += res.blob_gas_used;
+                space_state.use_space(res.space_used);
             }
             Err(err) => {
                 tracing::trace!(parent_order = ?parent.id(), ?err, "failed to simulate parent order");
@@ -485,20 +500,13 @@ pub fn simulate_order_using_fork<Tracer: SimulationTracer>(
     }
 
     // simulate
-    let result = fork.commit_order(&order, gas_used, 0, blob_gas_used, true)?;
+    let result = fork.commit_order(&order, space_state, true, &combined_refunds)?;
     let sim_time = start.elapsed();
     add_order_simulation_time(sim_time, "sim", result.is_ok()); // we count parent sim time + order sim time time here
 
     match result {
         Ok(res) => {
-            let sim_value = SimValue::new(
-                res.coinbase_profit,
-                res.gas_used,
-                res.blob_gas_used,
-                res.paid_kickbacks,
-                order.metadata().preconf_bid_price,
-                order.metadata().preconf_ordering
-            );
+            let sim_value = create_sim_value(&order, &res, mempool_tx_detector);
             let new_nonces = res.nonces_updated.into_iter().collect::<Vec<_>>();
             Ok(OrderSimResult::Success(
                 SimulatedOrder {

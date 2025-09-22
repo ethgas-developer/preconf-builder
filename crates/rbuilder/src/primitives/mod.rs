@@ -1,43 +1,53 @@
 //! Order types used as elements for block building.
 
+pub mod built_block;
 pub mod fmt;
 pub mod mev_boost;
 pub mod order_builder;
+pub mod order_statistics;
 pub mod serialize;
 mod test_data_generator;
 
-use crate::building::evm_inspector::UsedStateTrace;
+use crate::{
+    building::{evm_inspector::UsedStateTrace, BlockSpace},
+    preconf::PreconfOrdering,
+};
 use alloy_consensus::Transaction as _;
 use alloy_eips::{
     eip2718::{Decodable2718, Eip2718Error, Encodable2718},
-    eip4844::{Blob, BlobTransactionSidecar, Bytes48},
+    eip4844::{Blob, BlobTransactionSidecar, Bytes48, DATA_GAS_PER_BLOB},
+    eip7594::BlobTransactionSidecarVariant,
     Typed2718,
 };
 use alloy_primitives::{keccak256, Address, Bytes, TxHash, B256, U256};
+use alloy_rlp::Encodable as _;
 use derivative::Derivative;
 use integer_encoding::VarInt;
 use reth::transaction_pool::{
     BlobStore, BlobStoreError, EthPooledTransaction, Pool, TransactionOrdering, TransactionPool,
     TransactionValidator,
 };
+use reth_ethereum_primitives::PooledTransactionVariant;
 use reth_node_core::primitives::SignedTransaction;
 use reth_primitives::{
     kzg::{BYTES_PER_BLOB, BYTES_PER_COMMITMENT, BYTES_PER_PROOF},
-    PooledTransaction, Recovered, Transaction, TransactionSigned,
+    Recovered, Transaction, TransactionSigned,
 };
+use reth_primitives_traits::{InMemorySize, SignerRecoverable};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{cmp::Ordering, collections::HashMap, fmt::Display, hash::Hash, str::FromStr, sync::Arc};
+use std::{
+    cmp::Ordering, collections::HashMap, fmt::Display, hash::Hash, mem, str::FromStr, sync::Arc,
+};
 pub use test_data_generator::TestDataGenerator;
 use thiserror::Error;
 use uuid::Uuid;
-use crate::preconf::PreconfOrdering;
-use reth_primitives_traits::SignerRecoverable;
 
 /// Extra metadata for ShareBundle/Bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Metadata {
     pub received_at_timestamp: time::OffsetDateTime,
+    pub refund_identity: Option<Address>,
     pub preconf_ordering: Option<U256>,
     pub preconf_bid_price: Option<U256>,
     pub slot: Option<u64>,
@@ -47,10 +57,18 @@ impl Metadata {
     pub fn with_current_received_at() -> Self {
         Self {
             received_at_timestamp: time::OffsetDateTime::now_utc(),
+            refund_identity: None,
             preconf_ordering: None,
             preconf_bid_price: None,
             slot: None,
         }
+    }
+}
+
+impl InMemorySize for Metadata {
+    fn size(&self) -> usize {
+        mem::size_of::<time::OffsetDateTime>() + // received_at_timestamp
+            mem::size_of::<Option<Address>>() // refund_identity
     }
 }
 
@@ -91,7 +109,7 @@ pub struct Nonce {
 }
 
 /// Information regarding a new/update replaceable Bundle/ShareBundle.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplacementData<KeyType> {
     pub key: KeyType,
     /// Due to simulation async problems Bundle updates can arrive out of order.
@@ -117,9 +135,9 @@ pub struct BundleRefund {
     pub percent: u8,
     /// Address where to refund to.
     pub recipient: Address,
-    /// A list of transaction hashes to refund.
-    /// This means that part (percent%) of the profit from the execution these txs goes to refund.recipient
-    pub tx_hashes: Vec<TxHash>,
+    /// Transaction hash to refund.
+    /// This means that part (percent%) of the profit from the execution this txs goes to refund.recipient
+    pub tx_hash: TxHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -352,6 +370,7 @@ impl ShareBundleTx {
 /// Body element of a mev share bundle.
 /// [`ShareBundleInner::body`] is formed by several of these.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[allow(clippy::large_enum_variant)]
 pub enum ShareBundleBody {
     Tx(ShareBundleTx),
     Bundle(ShareBundleInner),
@@ -485,7 +504,7 @@ impl ShareBundleInner {
 }
 
 /// Uniquely identifies a replaceable sbundle or bundle
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Serialize, Deserialize)]
 pub struct ReplacementKey {
     pub id: Uuid,
     /// None means we don't have signer so the identity will be only by uuid.
@@ -637,8 +656,8 @@ impl ShareBundle {
 #[derivative(Clone, PartialEq, Eq)]
 pub struct TransactionSignedEcRecoveredWithBlobs {
     tx: Recovered<TransactionSigned>,
-    /// Will have a non empty BlobTransactionSidecar if Recovered<TransactionSigned> is 4844
-    pub blobs_sidecar: Arc<BlobTransactionSidecar>,
+    /// Will have a non empty BlobTransactionSidecarVariant if Recovered<TransactionSigned> is 4844
+    pub blobs_sidecar: Arc<BlobTransactionSidecarVariant>,
 
     #[derivative(PartialEq = "ignore", Hash = "ignore")]
     pub metadata: Metadata,
@@ -710,7 +729,7 @@ impl TransactionSignedEcRecoveredWithBlobs {
     /// or blobs without an eip4844.
     pub fn new(
         tx: Recovered<TransactionSigned>,
-        blob_sidecar: Option<BlobTransactionSidecar>,
+        blob_sidecar: Option<BlobTransactionSidecarVariant>,
         metadata: Option<Metadata>,
     ) -> Result<Self, TxWithBlobsCreateError> {
         // Check for an eip4844 tx passed without blobs
@@ -721,12 +740,42 @@ impl TransactionSignedEcRecoveredWithBlobs {
             Err(TxWithBlobsCreateError::BlobsMissingEip4844)
         // Groovy!
         } else {
+            let sidecar = blob_sidecar.unwrap_or(Self::default_blob_sidecar());
             Ok(Self {
                 tx,
-                blobs_sidecar: Arc::new(blob_sidecar.unwrap_or_default()),
+                blobs_sidecar: Arc::new(sidecar),
                 metadata: metadata.unwrap_or_default(),
             })
         }
+    }
+
+    /// Estimated length used to measure block space so avoid reaching EIP-7934 limit.
+    pub fn length_eip7934(&self) -> usize {
+        self.tx.inner().length()
+    }
+
+    pub fn space_needed(&self) -> BlockSpace {
+        BlockSpace::new(
+            self.tx.gas_limit(),
+            self.length_eip7934(),
+            self.blobs_gas_used(),
+        )
+    }
+
+    pub fn blobs_len(&self) -> usize {
+        match self.blobs_sidecar.as_ref() {
+            BlobTransactionSidecarVariant::Eip4844(sidecar) => sidecar.blobs.len(),
+            BlobTransactionSidecarVariant::Eip7594(sidecar) => sidecar.blobs.len(),
+        }
+    }
+
+    pub fn blobs_gas_used(&self) -> u64 {
+        self.blobs_len() as u64 * DATA_GAS_PER_BLOB
+    }
+
+    /// For when we don't have a sidecar. Not sure if Eip4844 is the right choice.
+    fn default_blob_sidecar() -> BlobTransactionSidecarVariant {
+        BlobTransactionSidecarVariant::Eip4844(BlobTransactionSidecar::default())
     }
 
     /// Shorthand for `new(tx, None, None)`
@@ -751,9 +800,12 @@ impl TransactionSignedEcRecoveredWithBlobs {
         T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
         S: BlobStore,
     {
+        /* At aprox 2025-08 get_blob was failing so we switched to get_all_blobs.
         let blob_sidecar = pool
         .get_blob(*tx.inner().hash())?
-        .and_then(|b| b.as_eip4844().cloned());
+        .map(|b| b.as_ref().clone());*/
+        let mut blobs = pool.get_all_blobs(vec![*tx.inner().hash()])?;
+        let blob_sidecar = blobs.pop().map(|(_, arc)| arc.as_ref().clone());
         Self::new(tx, blob_sidecar, None)
     }
 
@@ -761,7 +813,7 @@ impl TransactionSignedEcRecoveredWithBlobs {
     pub fn new_for_testing(tx: Recovered<TransactionSigned>) -> Self {
         Self {
             tx,
-            blobs_sidecar: Default::default(),
+            blobs_sidecar: Arc::new(Self::default_blob_sidecar()),
             metadata: Default::default(),
         }
     }
@@ -810,20 +862,20 @@ impl TransactionSignedEcRecoveredWithBlobs {
         raw_tx: Bytes,
     ) -> Result<TransactionSignedEcRecoveredWithBlobs, TxWithBlobsCreateError> {
         let raw_tx = &mut raw_tx.as_ref();
-        let pooled_tx = PooledTransaction::decode_2718(raw_tx)
+        let pooled_tx = PooledTransactionVariant::decode_2718(raw_tx)
             .map_err(TxWithBlobsCreateError::FailedToDecodeTransaction)?;
         let signer = pooled_tx
             .recover_signer()
             .map_err(|_| TxWithBlobsCreateError::InvalidTransactionSignature)?;
         match pooled_tx {
-            PooledTransaction::Legacy(_)
-            | PooledTransaction::Eip2930(_)
-            | PooledTransaction::Eip1559(_)
-            | PooledTransaction::Eip7702(_) => {
+            PooledTransactionVariant::Legacy(_)
+            | PooledTransactionVariant::Eip2930(_)
+            | PooledTransactionVariant::Eip1559(_)
+            | PooledTransactionVariant::Eip7702(_) => {
                 let tx_signed = TransactionSigned::from(pooled_tx);
                 TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx_signed.with_signer(signer))
             }
-            PooledTransaction::Eip4844(blob_tx) => {
+            PooledTransactionVariant::Eip4844(blob_tx) => {
                 let (blob_tx, signature, hash) = blob_tx.into_parts();
                 let (blob_tx, sidecar) = blob_tx.into_parts();
                 let tx_signed = TransactionSigned::new_unchecked(
@@ -859,7 +911,7 @@ impl TransactionSignedEcRecoveredWithBlobs {
         }
         Ok(TransactionSignedEcRecoveredWithBlobs {
             tx,
-            blobs_sidecar: Arc::new(fake_sidecar),
+            blobs_sidecar: Arc::new(BlobTransactionSidecarVariant::Eip4844(fake_sidecar)),
             metadata: Metadata::default(),
         })
     }
@@ -887,6 +939,14 @@ impl MempoolTx {
     }
 }
 
+impl InMemorySize for MempoolTx {
+    fn size(&self) -> usize {
+        self.tx_with_blobs.tx.inner().size()
+            + self.tx_with_blobs.blobs_sidecar.size()
+            + self.tx_with_blobs.metadata.size()
+    }
+}
+
 /// Main type used for block building, we build blocks as sequences of Orders
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Order {
@@ -896,7 +956,7 @@ pub enum Order {
 }
 
 /// Uniquely identifies a replaceable sbundle
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ShareBundleReplacementKey(ReplacementKey);
 impl ShareBundleReplacementKey {
     pub fn new(id: Uuid, signer: Address) -> Self {
@@ -912,7 +972,7 @@ impl ShareBundleReplacementKey {
 }
 
 /// Uniquely identifies a replaceable bundle
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BundleReplacementKey(ReplacementKey);
 impl BundleReplacementKey {
     pub fn new(id: Uuid, signer: Option<Address>) -> Self {
@@ -1080,9 +1140,7 @@ impl Order {
     }
 
     pub fn has_blobs(&self) -> bool {
-        self.list_txs()
-            .iter()
-            .any(|(tx, _)| !tx.blobs_sidecar.blobs.is_empty())
+        self.list_txs().iter().any(|(tx, _)| tx.blobs_len() > 0)
     }
 
     pub fn target_block(&self) -> Option<u64> {
@@ -1111,31 +1169,16 @@ impl Order {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SimValue {
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub struct ProfitInfo {
     /// profit as coinbase delta after executing an Order
-    pub coinbase_profit: U256,
-    pub gas_used: u64,
-    #[serde(default)]
-    pub blob_gas_used: u64,
+    coinbase_profit: U256,
     /// This is computed as coinbase_profit/gas_used so it includes not only gas tip but also payments made directly to coinbase
-    pub mev_gas_price: U256,
-    /// Kickbacks paid during simulation as (receiver, amount)
-    pub paid_kickbacks: Vec<(Address, U256)>,
-    // preconf related fields
-    pub preconf_bid_price: Option<U256>,
-    pub preconf_ordering: Option<U256>,
+    mev_gas_price: U256,
 }
 
-impl SimValue {
-    pub fn new(
-        coinbase_profit: U256,
-        gas_used: u64,
-        blob_gas_used: u64,
-        paid_kickbacks: Vec<(Address, U256)>,
-        preconf_bid_price: Option<U256>,
-        preconf_ordering: Option<U256>,
-    ) -> Self {
+impl ProfitInfo {
+    pub fn new(coinbase_profit: U256, gas_used: u64) -> Self {
         let mev_gas_price = if gas_used != 0 {
             coinbase_profit / U256::from(gas_used)
         } else {
@@ -1143,9 +1186,54 @@ impl SimValue {
         };
         Self {
             coinbase_profit,
-            gas_used,
-            blob_gas_used,
             mev_gas_price,
+        }
+    }
+
+    /// For testing specific values ignoring gas.
+    pub fn new_test(coinbase_profit: U256, mev_gas_price: U256) -> Self {
+        Self {
+            coinbase_profit,
+            mev_gas_price,
+        }
+    }
+
+    pub fn coinbase_profit(&self) -> U256 {
+        self.coinbase_profit
+    }
+
+    pub fn mev_gas_price(&self) -> U256 {
+        self.mev_gas_price
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+pub struct SimValue {
+    /// ProfitInfo considering profit from all txs on the s/bundles.
+    full_profit_info: ProfitInfo,
+    /// ProfitInfo considering profit only from non mempool txs on the s/bundles.
+    /// For mempool orders it should match ProfitInfo
+    non_mempool_profit_info: ProfitInfo,
+    space_used: BlockSpace,
+    /// Kickbacks paid during simulation as (receiver, amount)
+    paid_kickbacks: Vec<(Address, U256)>,
+}
+
+impl SimValue {
+    pub fn new(
+        // full profit
+        full_coinbase_profit: U256,
+        // for s/bundles profit from non-mempool txs.
+        non_mempool_coinbase_profit: U256,
+        space_used: BlockSpace,
+        paid_kickbacks: Vec<(Address, U256)>,
+        preconf_bid_price: Option<U256>,
+        preconf_ordering: Option<U256>,
+    ) -> Self {
+        Self {
+            full_profit_info: ProfitInfo::new(full_coinbase_profit, space_used.gas),
+            non_mempool_profit_info: ProfitInfo::new(non_mempool_coinbase_profit, space_used.gas),
+            space_used,
             paid_kickbacks,
             preconf_bid_price,
             preconf_ordering,
@@ -1174,7 +1262,7 @@ impl SimulatedOrder {
     pub fn is_bottom_preconf(&self) -> bool {
         self.order.is_bottom_preconf()
     }
-    
+
     pub fn is_payout_preconf(&self) -> bool {
         self.order.is_payout_preconf()
     }
@@ -1237,9 +1325,9 @@ impl FromStr for OrderId {
 impl Display for OrderId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Tx(hash) => write!(f, "tx:{:?}", hash),
-            Self::Bundle(uuid) => write!(f, "bundle:{:?}", uuid),
-            Self::ShareBundle(hash) => write!(f, "sbundle:{:?}", hash),
+            Self::Tx(hash) => write!(f, "tx:{hash:?}"),
+            Self::Bundle(uuid) => write!(f, "bundle:{uuid:?}"),
+            Self::ShareBundle(hash) => write!(f, "sbundle:{hash:?}"),
         }
     }
 }
@@ -1319,7 +1407,7 @@ mod tests {
     fn can_execute_single_optional_tx() {
         let needed_base_gas: u128 = 100000;
         let tx = Recovered::new_unchecked(
-            TransactionSigned::new(
+            TransactionSigned::new_unchecked(
                 Transaction::Legacy(TxLegacy {
                     gas_price: needed_base_gas,
                     ..Default::default()

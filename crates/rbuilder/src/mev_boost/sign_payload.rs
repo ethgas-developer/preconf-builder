@@ -1,21 +1,11 @@
-use super::submission::{
-    CapellaSubmitBlockRequest, DenebSubmitBlockRequest, ElectraSubmitBlockRequest,
-    SubmitBlockRequest,
-};
 use crate::utils::u256decimal_serde_helper;
 use alloy_eips::eip7685::Requests;
 use alloy_eips::{eip2718::Encodable2718, eip4844::BlobTransactionSidecar};
 use alloy_primitives::{Address, BlockHash, Bytes, FixedBytes, B256, U256};
 use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
 use alloy_rpc_types_beacon::{
-    events::PayloadAttributesData,
-    relay::{BidTrace, SignedBidSubmissionV2, SignedBidSubmissionV3, SignedBidSubmissionV4},
-    BlsPublicKey,
+    events::PayloadAttributesData, relay::BidTrace, BlsPublicKey, BlsSignature,
 };
-use alloy_rpc_types_engine::{
-    BlobsBundleV1, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
-};
-use alloy_rpc_types_eth::Withdrawal;
 use ethereum_consensus::{
     crypto::SecretKey,
     primitives::{BlsPublicKey as BlsPublicKey2, ExecutionAddress, Hash32},
@@ -23,10 +13,8 @@ use ethereum_consensus::{
     ssz::prelude::*,
 };
 use primitive_types::H384;
-use reth_chainspec::{ChainSpec, EthereumHardforks};
 use reth_primitives::SealedBlock;
 use serde_with::{serde_as, DisplayFromStr};
-use std::sync::Arc;
 
 /// Object to sign blocks to be sent to relays.
 #[derive(Debug, Clone)]
@@ -120,14 +108,10 @@ fn a2e_address(a: &Address) -> ExecutionAddress {
 pub fn sign_block_for_relay(
     signer: &BLSBlockSigner,
     sealed_block: &SealedBlock,
-    blobs_bundle: &[Arc<BlobTransactionSidecar>],
-    execution_requests: &[Bytes], // The Pectra execution requests for this bid.
-    chain_spec: &ChainSpec,
     attrs: &PayloadAttributesData,
     pubkey: H384,
     value: U256,
-    fee_recipient: Address,
-) -> eyre::Result<SubmitBlockRequest> {
+) -> eyre::Result<(BidTrace, BlsSignature)> {
     let message = BidTrace {
         slot: attrs.proposal_slot,
         parent_hash: attrs.parent_block_hash,
@@ -139,113 +123,8 @@ pub fn sign_block_for_relay(
         gas_used: sealed_block.gas_used,
         value,
     };
-
     let signature = signer.sign_payload(&message)?;
-    let signature = FixedBytes::from_slice(&signature);
-
-    let capella_payload = ExecutionPayloadV2 {
-        payload_inner: ExecutionPayloadV1 {
-            parent_hash: sealed_block.parent_hash,
-            fee_recipient: sealed_block.beneficiary,
-            state_root: sealed_block.state_root,
-            receipts_root: sealed_block.receipts_root,
-            logs_bloom: sealed_block.logs_bloom,
-            prev_randao: attrs.payload_attributes.prev_randao,
-            block_number: sealed_block.number,
-            gas_limit: sealed_block.gas_limit,
-            gas_used: sealed_block.gas_used,
-            timestamp: sealed_block.timestamp,
-            extra_data: sealed_block.extra_data.clone(),
-            base_fee_per_gas: U256::from(sealed_block.base_fee_per_gas.unwrap_or_default()),
-            block_hash: sealed_block.hash(),
-            transactions: sealed_block
-                .body()
-                .transactions
-                .iter()
-                .map(|tx| {
-                    let mut buf = Vec::new();
-                    tx.encode_2718(&mut buf);
-                    buf.into()
-                })
-                .collect(),
-        },
-        withdrawals: sealed_block
-            .body()
-            .withdrawals
-            .clone()
-            .map(|w| {
-                w.into_iter()
-                    .map(|w| Withdrawal {
-                        index: w.index,
-                        validator_index: w.validator_index,
-                        address: w.address,
-                        amount: w.amount,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default(),
-    };
-
-    let submit_block_request = if chain_spec.is_cancun_active_at_timestamp(sealed_block.timestamp) {
-        let execution_payload = ExecutionPayloadV3 {
-            payload_inner: capella_payload,
-            blob_gas_used: sealed_block
-                .blob_gas_used
-                .expect("deneb block does not have blob gas used"),
-            excess_blob_gas: sealed_block
-                .excess_blob_gas
-                .expect("deneb block does not have excess blob gas"),
-        };
-
-        let blobs_bundle = marshal_txs_blobs_sidecars(blobs_bundle);
-        let execution_requests =
-            ExecutionRequestsV4::try_from(Requests::new(execution_requests.to_vec()))?;
-        if chain_spec.is_prague_active_at_timestamp(sealed_block.timestamp) {
-            SubmitBlockRequest::Electra(ElectraSubmitBlockRequest(SignedBidSubmissionV4 {
-                message,
-                execution_payload,
-                blobs_bundle,
-                signature,
-                execution_requests,
-            }))
-        } else {
-            SubmitBlockRequest::Deneb(DenebSubmitBlockRequest(SignedBidSubmissionV3 {
-                message,
-                execution_payload,
-                blobs_bundle,
-                signature,
-            }))
-        }
-    } else {
-        let execution_payload = capella_payload;
-        SubmitBlockRequest::Capella(CapellaSubmitBlockRequest(SignedBidSubmissionV2 {
-            message,
-            execution_payload,
-            signature,
-        }))
-    };
-
-    Ok(submit_block_request)
-}
-
-fn flatten_marshal<Source>(
-    txs_blobs_sidecars: &[Arc<BlobTransactionSidecar>],
-    vec_getter: impl Fn(&Arc<BlobTransactionSidecar>) -> Vec<Source>,
-) -> Vec<Source> {
-    let flatten_data = txs_blobs_sidecars.iter().flat_map(vec_getter);
-    flatten_data.collect::<Vec<Source>>()
-}
-
-fn marshal_txs_blobs_sidecars(txs_blobs_sidecars: &[Arc<BlobTransactionSidecar>]) -> BlobsBundleV1 {
-    let rpc_commitments = flatten_marshal(txs_blobs_sidecars, |t| t.commitments.clone());
-    let rpc_proofs = flatten_marshal(txs_blobs_sidecars, |t| t.proofs.clone());
-    let rpc_blobs = flatten_marshal(txs_blobs_sidecars, |t| t.blobs.clone());
-
-    BlobsBundleV1 {
-        commitments: rpc_commitments,
-        proofs: rpc_proofs,
-        blobs: rpc_blobs,
-    }
+    Ok((message, FixedBytes::from_slice(&signature)))
 }
 
 #[cfg(test)]

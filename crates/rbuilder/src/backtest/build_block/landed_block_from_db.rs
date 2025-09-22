@@ -26,7 +26,7 @@ use crate::{
         base_config::load_config_toml_and_env, block_list_provider::BlockList,
         cli::LiveBuilderConfig,
     },
-    utils::{timestamp_as_u64, ProviderFactoryReopener},
+    utils::{timestamp_as_u64, timestamp_ms_to_offset_datetime, ProviderFactoryReopener},
 };
 use clap::Parser;
 use std::{path::PathBuf, sync::Arc};
@@ -123,8 +123,9 @@ impl<ConfigType: LiveBuilderConfig>
             self.blocklist.clone(),
             signer.address,
             self.block_data.winning_bid_trace.proposer_fee_recipient,
-            Some(signer),
+            signer,
             Arc::new(MockRootHasher {}),
+            self.config.base_config().evm_caching_enable,
         ))
     }
 
@@ -150,7 +151,7 @@ impl<ConfigType: LiveBuilderConfig>
 
 /// Reads from HistoricalDataStorage the BlockData for block.
 /// only_order_ids: if not empty returns only the given order ids.
-/// block_building_time_ms: If not 0, time it took to build the block. It allows us to filter out orders that arrived after we started building the block (filter_late_orders).
+/// block_building_time_ms: If not 0, time it took to build the block. It allows us to filter out orders that arrived after we started building the block.
 /// show_missing: show on-chain orders that weren't available to us at building time.
 async fn read_block_data(
     backtest_fetch_output_file: &PathBuf,
@@ -162,21 +163,24 @@ async fn read_block_data(
     let mut historical_data_storage =
         HistoricalDataStorage::new_from_path(backtest_fetch_output_file).await?;
 
-    let mut block_data = historical_data_storage.read_block_data(block).await?;
-
+    let full_block_data = historical_data_storage.read_block_data(block).await?;
+    let orders_cutoff_time = timestamp_ms_to_offset_datetime(
+        (full_block_data.winning_bid_trace.timestamp_ms as i64 - block_building_time_ms) as u64,
+    );
+    let mut block_data = full_block_data.snapshot_including_landed(orders_cutoff_time)?;
     if !only_order_ids.is_empty() {
         block_data.filter_orders_by_ids(&only_order_ids);
     }
-
-    block_data.filter_late_orders(block_building_time_ms);
-
     if show_missing {
         show_missing_txs(&block_data);
     }
 
     println!(
-        "Block: {} {:?}",
-        block_data.block_number, block_data.onchain_block.header.hash
+        "Block: {} {:?} landed at {} orders at {}",
+        block_data.block_number,
+        block_data.onchain_block.header.hash,
+        timestamp_ms_to_offset_datetime(full_block_data.winning_bid_trace.timestamp_ms),
+        orders_cutoff_time
     );
     println!(
         "bid value: {}",
@@ -264,10 +268,10 @@ fn print_onchain_block_data(tx_sim_results: Vec<ExecutedTxs>, block_data: &Block
                     order.error
                 );
                 for (other, tx) in &order.overlapping_txs {
-                    println!("    overlap with: {:>74} tx {:?}", other, tx);
+                    println!("    overlap with: {other:>74} tx {tx:?}");
                 }
             } else {
-                println!("{:>74} included order not found: ", included_order);
+                println!("{included_order:>74} included order not found: ");
             }
         }
     }
@@ -282,7 +286,7 @@ fn show_missing_txs(block_data: &BlockData) {
             missing_txs.len()
         );
         for missing_tx in missing_txs.iter() {
-            println!("Tx: {:?}", missing_tx);
+            println!("Tx: {missing_tx:?}");
         }
     }
     let missing_nonce_txs = block_data.search_missing_account_nonce_on_available_orders();

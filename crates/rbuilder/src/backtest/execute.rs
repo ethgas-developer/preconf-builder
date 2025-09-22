@@ -2,8 +2,9 @@ use crate::{
     backtest::BlockData,
     building::{
         builders::BacktestSimulateBlockInput, multi_share_bundle_merger::MultiShareBundleMerger,
-        sim::simulate_all_orders_with_sim_tree, BlockBuildingContext, BundleErr, OrderErr,
-        SimulatedOrderSink, SimulatedOrderStore, TransactionErr,
+        sim::simulate_all_orders_with_sim_tree, BlockBuildingContext, BundleErr,
+        NullPartialBlockExecutionTracer, OrderErr, SimulatedOrderSink, SimulatedOrderStore,
+        TransactionErr,
     },
     live_builder::{block_list_provider::BlockList, cli::LiveBuilderConfig},
     primitives::{OrderId, SimulatedOrder},
@@ -51,19 +52,18 @@ pub struct BlockBacktestValue {
 
 #[derive(Debug)]
 pub struct BacktestBlockInput {
-    pub ctx: BlockBuildingContext,
     pub sim_orders: Vec<Arc<SimulatedOrder>>,
     pub sim_errors: Vec<OrderErr>,
 }
 
-pub fn backtest_prepare_ctx_for_block<P>(
-    block_data: BlockData,
+pub fn backtest_get_block_building_context_for_block<P>(
+    block_data: &BlockData,
     provider: P,
     chain_spec: Arc<ChainSpec>,
     blocklist: BlockList,
-    sbundle_mergeabe_signers: &[Address],
     builder_signer: Signer,
-) -> eyre::Result<BacktestBlockInput>
+    evm_caching_enable: bool,
+) -> eyre::Result<BlockBuildingContext>
 where
     P: StateProviderFactory + Clone + 'static,
 {
@@ -72,28 +72,24 @@ where
         block_data.winning_bid_trace.parent_hash,
     );
     let ctx = BlockBuildingContext::from_onchain_block(
-        block_data.onchain_block,
+        block_data.onchain_block.clone(),
         chain_spec.clone(),
         None,
         blocklist,
         builder_signer.address,
         block_data.winning_bid_trace.proposer_fee_recipient,
-        Some(builder_signer),
+        builder_signer,
         Arc::from(provider.root_hasher(parent_num_hash)?),
+        evm_caching_enable,
     );
-    backtest_prepare_ctx_for_block_from_building_context(
-        ctx,
-        block_data.available_orders,
-        provider,
-        sbundle_mergeabe_signers,
-    )
+    Ok(ctx)
 }
 
-pub fn backtest_prepare_ctx_for_block_from_building_context<P>(
+pub fn backtest_prepare_orders_from_building_context<P>(
     ctx: BlockBuildingContext,
     available_orders: Vec<OrdersWithTimestamp>,
     provider: P,
-    sbundle_mergeabe_signers: &[Address],
+    sbundle_mergeable_signers: &[Address],
 ) -> eyre::Result<BacktestBlockInput>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -102,19 +98,21 @@ where
         .iter()
         .map(|order| order.order.clone())
         .collect::<Vec<_>>();
+    for order in &orders {
+        ctx.mempool_tx_detector.add_tx(order);
+    }
 
     let (sim_orders, sim_errors) =
         simulate_all_orders_with_sim_tree(provider, &ctx, &orders, false)?;
 
     // Apply bundle merging as in live building.
     let order_store = Rc::new(RefCell::new(SimulatedOrderStore::new()));
-    let mut merger = MultiShareBundleMerger::new(sbundle_mergeabe_signers, order_store.clone());
+    let mut merger = MultiShareBundleMerger::new(sbundle_mergeable_signers, order_store.clone());
     for sim_order in sim_orders {
         merger.insert_order(Arc::new(sim_order));
     }
     let sim_orders = order_store.borrow().get_orders();
     Ok(BacktestBlockInput {
-        ctx,
         sim_orders,
         sim_errors,
     })
@@ -128,6 +126,37 @@ pub fn backtest_simulate_block<P, ConfigType>(
     builders_names: Vec<String>,
     config: &ConfigType,
     blocklist: BlockList,
+    sbundle_mergeable_signers: &[Address],
+) -> eyre::Result<BlockBacktestValue>
+where
+    P: StateProviderFactory + Clone + 'static,
+    ConfigType: LiveBuilderConfig,
+{
+    let ctx = backtest_get_block_building_context_for_block(
+        &block_data,
+        provider.clone(),
+        chain_spec,
+        blocklist,
+        config.base_config().coinbase_signer()?,
+        config.base_config().evm_caching_enable,
+    )?;
+
+    backtest_simulate_block_with_context(
+        ctx,
+        block_data,
+        provider,
+        builders_names,
+        config,
+        sbundle_mergeable_signers,
+    )
+}
+
+pub fn backtest_simulate_block_with_context<P, ConfigType>(
+    ctx: BlockBuildingContext,
+    block_data: BlockData,
+    provider: P,
+    builders_names: Vec<String>,
+    config: &ConfigType,
     sbundle_mergeabe_signers: &[Address],
 ) -> eyre::Result<BlockBacktestValue>
 where
@@ -135,16 +164,13 @@ where
     ConfigType: LiveBuilderConfig,
 {
     let BacktestBlockInput {
-        ctx,
         sim_orders,
         sim_errors,
-    } = backtest_prepare_ctx_for_block(
-        block_data.clone(),
+    } = backtest_prepare_orders_from_building_context(
+        ctx.clone(),
+        block_data.available_orders,
         provider.clone(),
-        chain_spec.clone(),
-        blocklist,
         sbundle_mergeabe_signers,
-        config.base_config().coinbase_signer()?,
     )?;
 
     let filtered_orders_blocklist_count = sim_errors
@@ -162,13 +188,13 @@ where
         let mut count = 0;
         let mut amount = U256::ZERO;
         for sim in &sim_orders {
-            if sim.sim_value.paid_kickbacks.is_empty() {
+            if sim.sim_value.paid_kickbacks().is_empty() {
                 continue;
             }
             count += 1;
             amount += sim
                 .sim_value
-                .paid_kickbacks
+                .paid_kickbacks()
                 .iter()
                 .map(|(_, v)| v)
                 .sum::<U256>();
@@ -176,7 +202,7 @@ where
         (count, amount)
     };
 
-    let simulated_total_gas = sim_orders.iter().map(|o| o.sim_value.gas_used).sum();
+    let simulated_total_gas = sim_orders.iter().map(|o| o.sim_value.gas_used()).sum();
     let mut builder_outputs = Vec::new();
 
     for building_algorithm_name in builders_names {
@@ -187,7 +213,11 @@ where
             provider: provider.clone(),
         };
 
-        let block = config.build_backtest_block(&building_algorithm_name, input)?;
+        let block = config.build_backtest_block(
+            &building_algorithm_name,
+            input,
+            NullPartialBlockExecutionTracer {},
+        )?;
         builder_outputs.push(BacktestBuilderOutput {
             orders_included: block.trace.included_orders.len(),
             builder_name: building_algorithm_name,

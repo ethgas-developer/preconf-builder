@@ -94,10 +94,8 @@ impl<ConfigType: LiveBuilderConfig> SyntheticOrdersSource<ConfigType> {
                 replacement_data: None,
                 signer: None,
                 metadata: Metadata {
-                    preconf_ordering: None,
-                    preconf_bid_price: None,
-                    slot: None,
                     received_at_timestamp: time::OffsetDateTime::from_unix_timestamp(0).unwrap(),
+                    refund_identity: None,
                 },
                 dropping_tx_hashes: Default::default(),
                 refund: None,

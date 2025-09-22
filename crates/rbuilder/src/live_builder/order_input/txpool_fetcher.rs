@@ -150,7 +150,7 @@ mod test {
 
         let provider = ProviderBuilder::new()
             .wallet(wallet)
-            .on_http(anvil.endpoint().parse().unwrap());
+            .connect_http(anvil.endpoint().parse().unwrap());
 
         let alice = anvil.addresses()[0];
 
@@ -183,7 +183,7 @@ mod test {
         .unwrap();
 
         assert_eq!(tx_with_blobs.hash(), *pending_tx.tx_hash());
-        assert_eq!(tx_with_blobs.blobs_sidecar.blobs.len(), 1);
+        assert_eq!(tx_with_blobs.blobs_len(), 1);
 
         // send another tx without blobs
         let tx = TransactionRequest::default()
@@ -205,6 +205,6 @@ mod test {
         .unwrap();
 
         assert_eq!(tx_without_blobs.hash(), *pending_tx.tx_hash());
-        assert_eq!(tx_without_blobs.blobs_sidecar.blobs.len(), 0);
+        assert_eq!(tx_without_blobs.blobs_len(), 0);
     }
 }

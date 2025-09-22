@@ -1,5 +1,7 @@
 //! order_input handles receiving new orders from the ipc mempool subscription and json rpc server
 //!
+pub mod blob_type_order_filter;
+pub mod mempool_txs_detector;
 pub mod order_replacement_manager;
 pub mod order_sink;
 pub mod orderpool;
@@ -12,11 +14,12 @@ use self::{
     orderpool::{OrderPool, OrderPoolSubscriptionId},
     replaceable_order_sink::ReplaceableOrderSink,
 };
+use crate::provider::StateProviderFactory;
+use crate::telemetry::{set_current_block, set_ordepool_stats};
 use crate::{
-    preconf::{PreconfConfig, PreconfInfo, PreconfReservedInfo, PreconfState},
+    live_builder::base_config::DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS,
     primitives::{serialize::CancelShareBundle, BundleReplacementData, Order},
-    provider::StateProviderFactory,
-    telemetry::{set_current_block, set_ordepool_count},
+        preconf::{PreconfConfig, PreconfInfo, PreconfReservedInfo, PreconfState},
 };
 use alloy_consensus::Header;
 use jsonrpsee::RpcModule;
@@ -104,6 +107,8 @@ pub struct OrderInputConfig {
     results_channel_timeout: Duration,
     /// Size of the bounded channel.
     pub input_channel_buffer_size: usize,
+    /// See [OrderPool::time_to_keep_mempool_txs]
+    time_to_keep_mempool_txs: Duration,
 }
 pub const DEFAULT_SERVE_MAX_CONNECTIONS: u32 = 4096;
 pub const DEFAULT_RESULTS_CHANNEL_TIMEOUT: Duration = Duration::from_millis(50);
@@ -119,6 +124,7 @@ impl OrderInputConfig {
         serve_max_connections: u32,
         results_channel_timeout: Duration,
         input_channel_buffer_size: usize,
+        time_to_keep_mempool_txs: Duration,
     ) -> Self {
         Self {
             ignore_cancellable_orders,
@@ -129,6 +135,7 @@ impl OrderInputConfig {
             serve_max_connections,
             results_channel_timeout,
             input_channel_buffer_size,
+            time_to_keep_mempool_txs,
         }
     }
 
@@ -151,6 +158,7 @@ impl OrderInputConfig {
             serve_max_connections: 4096,
             results_channel_timeout: Duration::from_millis(50),
             input_channel_buffer_size: 10_000,
+            time_to_keep_mempool_txs: Duration::from_secs(config.time_to_keep_mempool_txs_secs),
         })
     }
 
@@ -164,12 +172,15 @@ impl OrderInputConfig {
             serve_max_connections: 4096,
             server_ip: Ipv4Addr::new(127, 0, 0, 1),
             server_port: 0,
+            time_to_keep_mempool_txs: Duration::from_secs(DEFAULT_TIME_TO_KEEP_MEMPOOL_TXS_SECS),
         }
     }
 }
 
 /// Commands we can get from RPC or mempool fetcher.
 #[derive(Debug, Clone)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+#[allow(clippy::large_enum_variant)]
 pub enum ReplaceableOrderPoolCommand {
     /// New or update order
     Order(Order),
@@ -220,7 +231,7 @@ where
         warn!("ignore_blobs is set to true, some order input is ignored");
     }
 
-    let orderpool = Arc::new(Mutex::new(OrderPool::new()));
+    let orderpool = Arc::new(Mutex::new(OrderPool::new(config.time_to_keep_mempool_txs)));
     let subscriber = OrderPoolSubscriber {
         orderpool: orderpool.clone(),
     };
@@ -245,11 +256,11 @@ where
     if config.mempool_source.is_some() {
         info!("Txpool source configured, starting txpool subscription");
         let txpool_fetcher = txpool_fetcher::subscribe_to_txpool_with_blobs(
-            config.clone(),
-            order_sender.clone(),
-            global_cancel.clone(),
-        )
-        .await?;
+                config.clone(),
+                order_sender.clone(),
+                global_cancel.clone(),
+            )
+            .await?;
         handles.push(txpool_fetcher);
     } else {
         info!("No Txpool source configured, skipping txpool subscription");
@@ -385,7 +396,7 @@ where
 
                         let update_time = start.elapsed();
                         let (tx_count, bundle_count) = orderpool.content_count();
-                        set_ordepool_count(tx_count, bundle_count);
+                        set_ordepool_stats(tx_count, bundle_count, orderpool.mempool_txs_size());
                         debug!(
                             current_block,
                             tx_count,

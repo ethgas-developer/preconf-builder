@@ -1,7 +1,11 @@
 use super::{evm::EvmFactory, BlockBuildingContext, BlockState, ThreadBlockBuildingContext};
-use crate::utils::Signer;
+use crate::{
+    building::BlockSpace,
+    utils::{constants::BASE_TX_GAS, Signer},
+};
 use alloy_consensus::{constants::KECCAK_EMPTY, TxEip1559};
 use alloy_primitives::{Address, TxKind as TransactionKind, U256};
+use alloy_rlp::Encodable as _;
 use reth_chainspec::ChainSpec;
 use reth_errors::ProviderError;
 use reth_evm::Evm;
@@ -39,9 +43,20 @@ pub enum PayoutTxErr {
     SignError(#[from] secp256k1::Error),
     #[error("EVM error: {0}")]
     EvmError(#[from] EVMError<ProviderError>),
-    #[error("Payout without signer")]
-    NoSigner,
 }
+
+impl PartialEq for PayoutTxErr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (PayoutTxErr::Reth(_), PayoutTxErr::Reth(_)) => true,
+            (PayoutTxErr::SignError(a), PayoutTxErr::SignError(b)) => a == b,
+            (PayoutTxErr::EvmError(_), PayoutTxErr::EvmError(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PayoutTxErr {}
 
 pub fn insert_test_payout_tx(
     to: Address,
@@ -50,7 +65,7 @@ pub fn insert_test_payout_tx(
     state: &mut BlockState,
     gas_limit: u64,
 ) -> Result<Option<u64>, PayoutTxErr> {
-    let builder_signer = ctx.builder_signer.as_ref().ok_or(PayoutTxErr::NoSigner)?;
+    let builder_signer = &ctx.builder_signer;
 
     let nonce = state.nonce(
         builder_signer.address,
@@ -68,12 +83,12 @@ pub fn insert_test_payout_tx(
         gas_limit,
         U256::from(tx_value),
     )?;
-
     let mut db = state.new_db_ref(&ctx.shared_cached_reads, &mut local_ctx.cached_reads);
     let mut evm = ctx.evm_factory.create_evm(db.as_mut(), ctx.evm_env.clone());
 
     let cache_account = evm.db_mut().load_cache_account(builder_signer.address)?;
-    cache_account.increment_balance(tx_value * 2); // double to cover tx value and fee
+    let gas_fee = ctx.evm_env.block_env.basefee as u128 * gas_limit as u128;
+    cache_account.increment_balance((tx_value + gas_fee) * 2); // double for luck
 
     let res = evm.transact(&tx)?;
     match res.result {
@@ -95,29 +110,70 @@ pub enum EstimatePayoutGasErr {
     #[error("Failed to estimate gas limit")]
     FailedToEstimate,
 }
+
+impl PartialEq for EstimatePayoutGasErr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (EstimatePayoutGasErr::Reth(_), EstimatePayoutGasErr::Reth(_)) => true,
+            (EstimatePayoutGasErr::PayoutTxErr(a), EstimatePayoutGasErr::PayoutTxErr(b)) => a == b,
+            (EstimatePayoutGasErr::FailedToEstimate, EstimatePayoutGasErr::FailedToEstimate) => {
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for EstimatePayoutGasErr {}
+
+fn estimate_payout_tx_space(ctx: &BlockBuildingContext) -> Result<BlockSpace, secp256k1::Error> {
+    let tx = create_payout_tx(
+        ctx.chain_spec.as_ref(),
+        ctx.evm_env.block_env.basefee,
+        &ctx.builder_signer,
+        0,
+        Address::ZERO,
+        ctx.evm_env.block_env.gas_limit,
+        U256::ZERO,
+    )?;
+    Ok(BlockSpace::new(
+        BASE_TX_GAS,
+        tx.inner().length() + 32 * 4, /* To account for any possible length encoding on ZERO fields */
+        0,
+    ))
+}
+
 pub fn estimate_payout_gas_limit(
     to: Address,
     ctx: &BlockBuildingContext,
     local_ctx: &mut ThreadBlockBuildingContext,
     state: &mut BlockState,
-    gas_used: u64,
-) -> Result<u64, EstimatePayoutGasErr> {
+    space_used: BlockSpace,
+) -> Result<BlockSpace, EstimatePayoutGasErr> {
     tracing::trace!(address = ?to, "Estimating payout gas");
+    // To simplify we compute the default payout tx rlp_length only once here. It's not worth computing the exact rlp_length for each estimation.
+    let default_payout_tx_space =
+        estimate_payout_tx_space(ctx).map_err(|_| EstimatePayoutGasErr::FailedToEstimate)?;
     if state.code_hash(to, &ctx.shared_cached_reads, &mut local_ctx.cached_reads)? == KECCAK_EMPTY {
-        return Ok(21_000);
+        return Ok(default_payout_tx_space);
     }
 
+    // We probably have a bug here since no reserved space was propagated but with a little bit of luck it will work because we call can_fit_tx later?
     let gas_left = ctx
         .evm_env
         .block_env
         .gas_limit
-        .checked_sub(gas_used)
+        .checked_sub(space_used.gas)
         .unwrap_or_default();
     let estimation = insert_test_payout_tx(to, ctx, local_ctx, state, gas_left)?
         .ok_or(EstimatePayoutGasErr::FailedToEstimate)?;
 
     if insert_test_payout_tx(to, ctx, local_ctx, state, estimation)?.is_some() {
-        return Ok(estimation);
+        return Ok(BlockSpace::new(
+            estimation,
+            default_payout_tx_space.rlp_length,
+            0,
+        ));
     }
 
     let mut left = estimation;
@@ -127,7 +183,11 @@ pub fn estimate_payout_gas_limit(
     loop {
         let mid = (left + right) / 2;
         if mid == left || mid == right {
-            return Ok(right);
+            return Ok(BlockSpace::new(
+                right,
+                default_payout_tx_space.rlp_length,
+                0,
+            ));
         }
 
         if insert_test_payout_tx(to, ctx, local_ctx, state, mid)?.is_some() {
@@ -190,15 +250,16 @@ mod tests {
             Default::default(),
             signer.address,
             proposer,
-            Some(signer),
+            signer,
             Arc::new(MockRootHasher {}),
+            false,
         );
         let mut state = BlockState::new(provider_factory.latest().unwrap());
         let mut local_ctx = ThreadBlockBuildingContext::default();
 
         let estimate_result =
-            estimate_payout_gas_limit(proposer, &ctx, &mut local_ctx, &mut state, 0);
+            estimate_payout_gas_limit(proposer, &ctx, &mut local_ctx, &mut state, BlockSpace::ZERO);
         assert_matches!(estimate_result, Ok(_));
-        assert_eq!(estimate_result.unwrap(), 21_000);
+        assert_eq!(estimate_result.unwrap().gas, 21_000);
     }
 }

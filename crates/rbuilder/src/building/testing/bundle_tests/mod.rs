@@ -1,19 +1,16 @@
 pub mod setup;
 
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, Bytes, B256, U256};
 use itertools::Itertools;
-use std::collections::HashSet;
-use uuid::Uuid;
+use reth_primitives::Bytecode;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     building::{
-        testing::bundle_tests::setup::NonceValue, BuiltBlockTrace, BundleErr, OrderErr,
-        TransactionErr,
+        testing::bundle_tests::setup::NonceValue, BuiltBlockTrace, BundleErr, ExecutionResult,
+        OrderErr, TransactionErr,
     },
-    primitives::{
-        Bundle, BundleRefund, BundleReplacementData, BundleReplacementKey, Order, OrderId, Refund,
-        RefundConfig, TxRevertBehavior,
-    },
+    primitives::{Bundle, BundleRefund, Order, OrderId, Refund, RefundConfig, TxRevertBehavior},
     utils::{constants::BASE_TX_GAS, int_percentage},
 };
 
@@ -250,9 +247,9 @@ fn bundle_revert_tests(
         current_slot_value + 100,
     )?;
     let result = test_setup.commit_order_ok();
-    assert_eq!(result.receipts.len(), 2);
-    assert!(result.receipts[0].success);
-    assert!(!result.receipts[1].success);
+    assert_eq!(result.tx_infos.len(), 2);
+    assert!(result.tx_infos[0].receipt.success);
+    assert!(!result.tx_infos[1].receipt.success);
 
     // this bundle has 2 txs one ok other has incorrect nonce
     begin_bundle(test_setup);
@@ -264,8 +261,8 @@ fn bundle_revert_tests(
         current_slot_value,
     )?;
     let result = test_setup.commit_order_ok();
-    assert_eq!(result.receipts.len(), 1);
-    assert!(result.receipts[0].success);
+    assert_eq!(result.tx_infos.len(), 1);
+    assert!(result.tx_infos[0].receipt.success);
 
     // for share bundle also try nested bundles
     if share_bundle {
@@ -328,35 +325,140 @@ fn test_share_bundle_revert() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Test combined refunds
 #[test]
-fn test_bundle_ok_refunds() -> eyre::Result<()> {
+fn test_bundle_combined_refunds() -> eyre::Result<()> {
     let target_block = 11;
-    let mut test_setup = TestSetup::gen_test_setup(BlockArgs::default().number(target_block))?;
     let profit: u64 = 100_000;
-    let percent: u8 = 90;
-    let refundable_value = int_percentage(profit, percent as usize);
+    let refund_percent: u8 = 90;
+    let refundable_value = int_percentage(profit, refund_percent as usize);
+
+    let mut test_setup = TestSetup::gen_test_setup(BlockArgs::default().number(target_block))?;
+    let recipient = NamedAddr::User(2);
+    let recipient_address = test_setup.named_address(recipient)?;
+    let recipient_balance_before = test_setup.balance(recipient)?;
+
+    let commit_refund_order =
+        |setup: &mut TestSetup, recipient: Address| -> eyre::Result<ExecutionResult> {
+            setup.begin_bundle_order(target_block);
+            setup.add_dummy_tx_0_1_no_rev()?;
+            let profit_tx_hash = setup.add_send_to_coinbase_tx(NamedAddr::User(1), profit)?;
+            setup.set_bundle_refund(BundleRefund {
+                recipient,
+                percent: refund_percent,
+                tx_hash: profit_tx_hash,
+            });
+            Ok(setup.commit_order_ok())
+        };
+
+    let result = commit_refund_order(&mut test_setup, recipient_address).unwrap();
+    assert!(result.paid_kickbacks.is_empty());
+    assert_eq!(test_setup.balance(recipient)?, recipient_balance_before);
+    assert_eq!(
+        test_setup.partial_block().combined_refunds,
+        HashMap::from_iter([(
+            recipient_address,
+            U256::from(refundable_value - BASE_TX_GAS)
+        )])
+    );
+
+    let result = commit_refund_order(&mut test_setup, recipient_address).unwrap();
+    assert!(result.paid_kickbacks.is_empty());
+    assert_eq!(test_setup.balance(recipient)?, recipient_balance_before);
+    assert_eq!(
+        test_setup.partial_block().combined_refunds,
+        HashMap::from_iter([(
+            recipient_address,
+            U256::from(refundable_value * 2 - BASE_TX_GAS)
+        )])
+    );
+
+    let second_recipient = NamedAddr::User(3);
+    let second_recipient_address = test_setup.named_address(second_recipient)?;
+    let second_recipient_balance_before = test_setup.balance(second_recipient)?;
+
+    let result = commit_refund_order(&mut test_setup, second_recipient_address).unwrap();
+    assert!(result.paid_kickbacks.is_empty());
+    assert_eq!(
+        test_setup.balance(second_recipient)?,
+        second_recipient_balance_before
+    );
+    assert_eq!(
+        test_setup.partial_block().combined_refunds,
+        HashMap::from_iter([
+            (
+                recipient_address,
+                U256::from(refundable_value * 2 - BASE_TX_GAS)
+            ),
+            (
+                second_recipient_address,
+                U256::from(refundable_value - BASE_TX_GAS)
+            )
+        ])
+    );
+
+    Ok(())
+}
+
+/// Test immediate refunds to contract recipients
+#[test]
+fn test_bundle_contract_refunds() -> eyre::Result<()> {
+    let target_block = 11;
+    let profit: u64 = 100_000;
+    let refund_percent: u8 = 90;
+    let refundable_value = int_percentage(profit, refund_percent as usize);
+
+    let mut test_setup = TestSetup::gen_test_setup(BlockArgs::default().number(target_block))?;
     let recipient_named_address = NamedAddr::User(2);
-    let recipient = test_setup.named_address(recipient_named_address)?;
+    let recipient_contract_address = test_setup.named_address(recipient_named_address)?;
+    test_setup
+        .chain_state_mut()
+        .upsert_contract(
+            recipient_contract_address,
+            Bytecode::new_raw(Bytes::from([0x38 /* CODESIZE */])),
+        )
+        .unwrap();
+
     let recipient_balance_before = test_setup.balance(recipient_named_address)?;
     test_setup.begin_bundle_order(target_block);
     test_setup.add_dummy_tx_0_1_no_rev()?;
     let profit_tx_hash = test_setup.add_send_to_coinbase_tx(NamedAddr::User(1), profit)?;
     test_setup.set_bundle_refund(BundleRefund {
-        percent,
-        recipient,
-        tx_hashes: vec![profit_tx_hash],
+        percent: refund_percent,
+        recipient: recipient_contract_address,
+        tx_hash: profit_tx_hash,
     });
     let result = test_setup.commit_order_ok();
     let recipient_balance_after = test_setup.balance(recipient_named_address)?;
-    let expected_refund = refundable_value - BASE_TX_GAS;
+    let expected_refund = refundable_value - BASE_TX_GAS - 2 /* 0x38 CODESIZE cost */;
     assert_eq!(
         recipient_balance_after - recipient_balance_before,
         expected_refund as i128
     );
     assert_eq!(
         result.paid_kickbacks,
-        vec![(recipient, U256::from(expected_refund))]
+        vec![(recipient_contract_address, U256::from(expected_refund))]
     );
+    Ok(())
+}
+
+#[test]
+fn test_bundle_ok_inner_tx_profits() -> eyre::Result<()> {
+    let target_block = 11;
+    let mut test_setup = TestSetup::gen_test_setup(BlockArgs::default().number(target_block))?;
+    let profits = [100_000u64, 200_000u64, 10u64];
+    let mut tx_hashes = Vec::default();
+    test_setup.begin_bundle_order(target_block);
+    for (index, profit) in profits.iter().enumerate() {
+        tx_hashes.push(test_setup.add_send_to_coinbase_tx(NamedAddr::User(index), *profit)?);
+    }
+    let result = test_setup.commit_order_ok();
+    let executed_profits = result
+        .tx_infos
+        .iter()
+        .map(|info| u64::try_from(info.coinbase_profit).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(profits, executed_profits.as_slice());
     Ok(())
 }
 
@@ -585,32 +687,6 @@ fn test_bundle_consistency_check() -> eyre::Result<()> {
         assert!(err.to_string().contains("Bundle tx reverted"));
     }
 
-    // check commit of 2 bundles with the same replacement uuid
-    {
-        let replacement_data = BundleReplacementData {
-            key: BundleReplacementKey::new(Uuid::from_u128(100), Some(Address::random())),
-            sequence_number: 0,
-        };
-        let mut built_block_trace = BuiltBlockTrace::new();
-
-        test_setup.begin_bundle_order(11);
-        test_setup.set_bundle_replacement_data(replacement_data.clone());
-        test_setup.add_dummy_tx_0_1_no_rev()?;
-        let res = test_setup.commit_order_ok();
-        built_block_trace.add_included_order(res);
-
-        test_setup.begin_bundle_order(11);
-        test_setup.set_bundle_replacement_data(replacement_data);
-        test_setup.add_dummy_tx_0_1_no_rev()?;
-        let res = test_setup.commit_order_ok();
-        built_block_trace.add_included_order(res);
-
-        let err = built_block_trace
-            .verify_bundle_consistency(&blocklist)
-            .expect_err("Expected error");
-        assert!(err.to_string().contains("replacement data"));
-    }
-
     // check commit of blocklisted tx from
     {
         let blocklist = vec![test_setup.named_address(NamedAddr::User(0))?]
@@ -650,48 +726,6 @@ fn test_bundle_consistency_check() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Values to use in contexts where we just want to check right or wrong execution and don't really care about the data
-const DONT_CARE_VALUE: u64 = 100_000;
-const DONT_CARE_PERCENTAGE: usize = 90;
-#[test]
-fn test_mev_share_use_suggested_fee_recipient_as_coinbase() -> eyre::Result<()> {
-    let target_block = 11;
-    let mut test_setup = TestSetup::gen_test_setup(
-        BlockArgs::default()
-            .number(target_block)
-            .use_suggested_fee_recipient_as_coinbase(true),
-    )?;
-    // Mev share with refunds should fail since it's disabled by use_suggested_fee_recipient_as_coinbase
-    test_setup.begin_share_bundle_order(target_block, target_block);
-    test_setup.add_dummy_tx(
-        NamedAddr::User(0),
-        NamedAddr::User(1),
-        DONT_CARE_VALUE,
-        TxRevertBehavior::NotAllowed,
-    )?;
-    test_setup.add_send_to_coinbase_tx(NamedAddr::User(1), DONT_CARE_VALUE)?;
-    test_setup.set_inner_bundle_refund(vec![Refund {
-        body_idx: 0,
-        percent: DONT_CARE_PERCENTAGE,
-    }]);
-    test_setup.commit_order_err_check(|err| {
-        assert!(matches!(err, OrderErr::Bundle(BundleErr::NoSigner)))
-    });
-
-    // Mev share without refunds is ok
-    test_setup.begin_share_bundle_order(target_block, target_block);
-    test_setup.add_dummy_tx(
-        NamedAddr::User(0),
-        NamedAddr::User(1),
-        DONT_CARE_VALUE,
-        TxRevertBehavior::NotAllowed,
-    )?;
-    test_setup.add_send_to_coinbase_tx(NamedAddr::User(1), DONT_CARE_VALUE)?;
-    test_setup.commit_order_ok();
-
-    Ok(())
-}
-
 #[test]
 ///Checks TxRevertBehavior::AllowedInclude/AllowedExcluded by checking the consumed gas.
 fn test_bundle_revert_modes() -> eyre::Result<()> {
@@ -721,7 +755,7 @@ fn bundle_revert_modes_tests(share_bundle: bool) -> eyre::Result<()> {
     // Bundles behave different to sbundles on empty execution
     if share_bundle {
         let res = test_setup.commit_order_ok();
-        assert_eq!(res.gas_used, 0);
+        assert_eq!(res.space_used.gas, 0);
     } else {
         test_setup.commit_order_err_check(|err| {
             assert!(matches!(err, OrderErr::Bundle(BundleErr::EmptyBundle)));
@@ -732,27 +766,27 @@ fn bundle_revert_modes_tests(share_bundle: bool) -> eyre::Result<()> {
     begin_bundle(&mut test_setup);
     test_setup.add_revert(tx_sender0, TxRevertBehavior::AllowedIncluded)?;
     let res = test_setup.commit_order_ok();
-    let reverting_gas = res.gas_used;
+    let reverting_gas = res.space_used.gas;
 
     // Measure reverting tx
     begin_bundle(&mut test_setup);
     test_setup.add_send_to_coinbase_tx(tx_sender0, 0)?;
     let res = test_setup.commit_order_ok();
-    let send_gas = res.gas_used;
+    let send_gas = res.space_used.gas;
 
     // send + rev on AllowedIncluded pay both gases
     begin_bundle(&mut test_setup);
     test_setup.add_send_to_coinbase_tx(tx_sender1, 0)?;
     test_setup.add_revert(tx_sender0, TxRevertBehavior::AllowedIncluded)?;
     let res = test_setup.commit_order_ok();
-    assert_eq!(res.gas_used, send_gas + reverting_gas);
+    assert_eq!(res.space_used.gas, send_gas + reverting_gas);
 
     // send + rev on AllowedExcluded pay send
     begin_bundle(&mut test_setup);
     test_setup.add_send_to_coinbase_tx(tx_sender0, 0)?;
     test_setup.add_revert(tx_sender1, TxRevertBehavior::AllowedExcluded)?;
     let res = test_setup.commit_order_ok();
-    assert_eq!(res.gas_used, send_gas);
+    assert_eq!(res.space_used.gas, send_gas);
 
     Ok(())
 }
@@ -780,10 +814,7 @@ fn test_subbundle_skip() -> eyre::Result<()> {
         if let OrderErr::Bundle(BundleErr::TransactionReverted(hash)) = err {
             assert_eq!(hash, revert_hash);
         } else {
-            panic!(
-                "got {} while expecting OrderErr::Bundle(BundleErr::TransactionReverted)",
-                err
-            );
+            panic!("got {err} while expecting OrderErr::Bundle(BundleErr::TransactionReverted)");
         }
     });
 
