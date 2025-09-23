@@ -452,6 +452,7 @@ impl LiveBuilderConfig for Config {
             )
             .await?;
 
+        let preconf_config = PreconfConfig::from_config(self);
         let live_builder = create_builder_from_sink(
             &self.base_config,
             &self.l1_config,
@@ -670,47 +671,6 @@ impl Default for Config {
                         pre_filtered_build_duration_deadline_ms: Some(0),
                     }),
                 },
-                BuilderConfig {
-                    name: String::from("mp-ordering-deadline"),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MaxProfit,
-                        failed_order_retries: 1,
-                        drop_failed_orders: true,
-                        coinbase_payment: false,
-                        build_duration_deadline_ms: Some(30),
-                    }),
-                },
-                BuilderConfig {
-                    name: String::from("mp-ordering-cb"),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MaxProfit,
-                        failed_order_retries: 1,
-                        drop_failed_orders: true,
-                        coinbase_payment: true,
-                        build_duration_deadline_ms: None,
-                    }),
-                },
-                BuilderConfig {
-                    name: String::from("mgp-ordering-default"),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MevGasPrice,
-                        failed_order_retries: 1,
-                        drop_failed_orders: false,
-                        coinbase_payment: false,
-                        build_duration_deadline_ms: None,
-                    }),
-                },
-                BuilderConfig {
-                    name: String::from("parallel"),
-                    builder: SpecificBuilderConfig::ParallelBuilder(ParallelBuilderConfig {
-                        discard_txs: true,
-                        num_threads: 25,
-                        coinbase_payment: false,
-                    }),
-                },
             ],
             slot_delta_to_start_bidding_ms: None,
             subsidy: None,
@@ -816,11 +776,7 @@ where
         Sorting::LengthThreeMevGasPrice => Arc::new(OrderingBuildingAlgorithm::<
             OrderLengthThreeMevGasPricePriority<ProfitInfoGetterType>,
         >::new(cfg, name)),
-        Sorting::Preconf => {
-                    crate::building::builders::ordering_builder::backtest_simulate_block::<
-                        P,
-                        PreconfPriority,
-                    >(config, input),
+        Sorting::Preconf => Arc::new(OrderingBuildingAlgorithm::<PreconfPriority<ProfitInfoGetterType>>::new(cfg, name))
     }
 }
 
@@ -1064,6 +1020,7 @@ pub async fn create_builder_from_sink<P>(
     slot_info_provider: Vec<MevBoostRelaySlotInfoProvider>,
     adjustment_fee_payers: ahash::HashMap<MevBoostRelayID, Address>,
     cancellation_token: CancellationToken,
+    preconf_config: PreconfConfig,
 ) -> eyre::Result<super::LiveBuilder<P>>
 where
     P: StateProviderFactory,
@@ -1085,6 +1042,7 @@ where
             cancellation_token,
             sink_factory,
             payload_event,
+            preconf_config,
             provider,
             blocklist_provider,
         )

@@ -1,8 +1,3 @@
-use crate::building::ThreadBlockBuildingContext;
-use crate::live_builder::simulation::SimulatedOrderCommand;
-use crate::primitives::SimValue;
-use crate::provider::RootHasher;
-use crate::roothash::RootHashError;
 use crate::{
     building::{
         BlockBuildingContext, BuiltBlockTrace, CriticalCommitOrderError, ExecutionError,
@@ -136,6 +131,8 @@ impl BlockBuildingHelper for MockBlockBuildingHelper {
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
         unimplemented!()
     }
+
+    fn deduct_reserve_gas(&mut self, gas: u64) {}
 }
 
 #[derive(Debug)]

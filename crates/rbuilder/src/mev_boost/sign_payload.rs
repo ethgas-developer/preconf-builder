@@ -118,7 +118,7 @@ pub fn sign_block_for_relay(
         block_hash: sealed_block.hash(),
         builder_pubkey: FixedBytes::from_slice(signer.pub_key().as_bytes()),
         proposer_pubkey: FixedBytes::from_slice(pubkey.as_bytes()),
-        proposer_fee_recipient: fee_recipient,
+        proposer_fee_recipient: attrs.payload_attributes.suggested_fee_recipient,
         gas_limit: sealed_block.gas_limit,
         gas_used: sealed_block.gas_used,
         value,

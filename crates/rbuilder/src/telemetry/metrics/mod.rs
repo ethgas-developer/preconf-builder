@@ -127,7 +127,6 @@ register_metrics! {
     )
     .unwrap();
 
-
     pub static CURRENT_BLOCK: IntGauge =
         IntGauge::new("current_block", "Current Block").unwrap();
     pub static ORDERPOOL_TXS: IntGauge =
@@ -161,7 +160,7 @@ register_metrics! {
     pub static SIMULATED_FAILED_ORDERS: IntCounter =
         IntCounter::new("simulated_failed_orders", "Simulated failed orders").unwrap();
     pub static SIMULATION_GAS_USED: IntCounter =
-        IntGauge::new("simulation_gas_used", "Simulation gas used").unwrap();
+        IntCounter::new("simulation_gas_used", "Simulation gas used").unwrap();
     pub static ACTIVE_SLOTS: IntCounter =
         IntCounter::new("active_slots", "Slots when builder was active").unwrap();
     pub static INITIATED_SUBMISSIONS: IntCounterVec = IntCounterVec::new(
@@ -273,6 +272,7 @@ register_metrics! {
 
     pub static TOTAL_LANDED_SUBSIDIES_SUM: Counter =
         Counter::new("total_landed_subsidies_sum", "Sum of all total landed subsidies").unwrap();
+
 
 
     pub static ORDERING_BUILDER_EXECUTED_ORDERS: HistogramVec = HistogramVec::new(
@@ -801,4 +801,3 @@ pub fn add_ordering_builder_pre_filtered_stage_stats(
 ) {
     add_ordering_builder_orders_executed(builder_name, BUILDING_STEP_PRE_FILTERED, ratio);
 }
-""

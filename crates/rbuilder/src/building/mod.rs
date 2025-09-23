@@ -357,10 +357,6 @@ impl BlockBuildingContext {
         self.attributes.timestamp
     }
 
-    pub fn timestamp_u64(&self) -> u64 {
-        self.attributes.timestamp
-    }
-
     pub fn block(&self) -> u64 {
         self.block_number
     }
@@ -561,6 +557,9 @@ impl BlockBuildingSpaceState {
         self.reserved_block_space
     }
 
+    // TODO(chirag)
+    pub fn add_reserve_gas(&mut self, gas: u64) {}
+
     /// Used+Reserved
     pub fn total_consumed_space(&self) -> BlockSpace {
         self.space_used + self.reserved_block_space
@@ -733,7 +732,6 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         PartialBlock {
             discard_txs: self.discard_txs,
             space_state: self.space_state,
-            gas_reserved: self.gas_reserved,
             coinbase_profit: self.coinbase_profit,
             executed_tx_infos: self.executed_tx_infos,
             combined_refunds: self.combined_refunds,
@@ -746,20 +744,18 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         self.space_state.reserve_block_space(space);
     }
 
-    pub fn add_reserve_gas(&mut self, gas: u64) {
-        self.gas_reserved += gas;
+    // TODO(chirag)
+    pub fn add_reserve_gas(&mut self, space: BlockSpace) {
+        // self.space_state.reserved_block_space.add(space);
     }
 
+    // TODO(chirag)
     pub fn deduct_reserve_gas(&mut self, gas: u64) {
-        self.gas_reserved -= gas;
+        // self.space_state.reserved_block_space -= gas;
     }
 
     pub fn free_reserved_block_space(&mut self) {
         self.space_state.free_reserved_block_space();
-    }
-
-    pub fn free_reserved_gas(&mut self) {
-        self.gas_reserved = 0;
     }
 
     /// result_filter: little hack to allow "cancel" the execution depending no the SimValue result. Ideally it would be nicer to split commit_order
@@ -804,7 +800,6 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         let exec_result = fork.commit_order(
             &order.order,
             self.space_state,
-            self.gas_reserved,
             self.discard_txs,
             &self.combined_refunds,
         )?;
@@ -816,8 +811,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         };
 
         let inplace_sim_result =
-            create_sim_value(&order.order, &ok_result, &ctx.mempool_tx_detector, ok_result.preconf_bid_price,
-            ok_result.preconf_ordering);
+            create_sim_value(&order.order, &ok_result, &ctx.mempool_tx_detector);
 
         match result_filter(&inplace_sim_result) {
             Ok(()) => {}
@@ -934,7 +928,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
             ctx.evm_env.block_env.basefee,
             builder_signer,
             nonce,
-            fee_recipient,
+            ctx.attributes.suggested_fee_recipient,
             gas_limit,
             value,
         )?;
@@ -1420,6 +1414,8 @@ pub fn create_sim_value(
         non_mempool_coinbase_profit,
         order_ok.space_used,
         order_ok.paid_kickbacks.clone(),
+        order_ok.preconf_bid_price,
+        order_ok.preconf_ordering,
     )
 }
 #[cfg(test)]
@@ -1469,6 +1465,8 @@ mod test {
             nonces_updated: Default::default(),
             paid_kickbacks: Default::default(),
             used_state_trace: Default::default(),
+            preconf_bid_price: None,
+            preconf_ordering: None,
         };
         // dummy bundle just to let know create_sim_value this is a bundle.
         let dummy_bundle = Order::Bundle(data_gen.create_bundle(
@@ -1510,6 +1508,8 @@ mod test {
             nonces_updated: Default::default(),
             paid_kickbacks: Default::default(),
             used_state_trace: Default::default(),
+            preconf_bid_price: None,
+            preconf_ordering: None,
         };
         let sim_value = create_sim_value(&order, &order_ok, &detector);
         assert_eq!(

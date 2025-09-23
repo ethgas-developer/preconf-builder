@@ -25,6 +25,7 @@ use crate::{
     utils::NonceCache,
 };
 use ahash::{HashMap, HashSet};
+use alloy_primitives::U256;
 use derivative::Derivative;
 use reth_provider::StateProvider;
 use serde::Deserialize;
@@ -175,7 +176,8 @@ where
     let block_orders =
         block_orders_from_sim_orders::<OrderPriorityType>(input.sim_orders, &state_provider)?;
     let mut local_ctx = ThreadBlockBuildingContext::default();
-      let preconf_reserved_gas = block_orders.get_bottom_preconf_gas() + block_orders.get_payout_preconf_gas();
+    let preconf_reserved_gas =
+        block_orders.get_bottom_preconf_gas() + block_orders.get_payout_preconf_gas();
     let mut builder = OrderingBuilderContext::new(
         Arc::from(state_provider),
         input.builder_name,
@@ -187,7 +189,7 @@ where
         block_orders,
         CancellationToken::new(),
         partial_block_execution_tracer,
-                preconf_reserved_gas,
+        preconf_reserved_gas,
     )?;
 
     let payout_tx_value = block_builder.true_block_value()?;
@@ -244,7 +246,7 @@ impl OrderingBuilderContext {
             block_orders,
             cancel_block,
             NullPartialBlockExecutionTracer {},
-            preconf_reserved_gas
+            preconf_reserved_gas,
         )
     }
 
@@ -265,17 +267,14 @@ impl OrderingBuilderContext {
         let forced_empty_block = U256::from(preconf_reserved_gas).eq(&gas_limit);
         let contains_preconf = block_orders.contains_preconf();
         let enabled_self_payout = forced_empty_block && !contains_preconf;
-        let enabled_coinbase_payout =
-            !enabled_self_payout && use_suggested_fee_recipient_as_coinbase;
 
-        trace!(
-            "enabled_coinbase_payout: {:?} -> enabled_self_payout: {:?}(forced_empty_block: {:?}, contains_preconf: {:?}), use_suggested_fee_recipient_as_coinbase: {:?}",
-            enabled_coinbase_payout,
-            enabled_self_payout,
-            forced_empty_block,
-            contains_preconf,
-            use_suggested_fee_recipient_as_coinbase
-        );
+        // trace!(
+        //     "enabled_coinbase_payout: {:?} -> enabled_self_payout: {:?}(forced_empty_block: {:?}, contains_preconf: {:?})",
+        //     enabled_coinbase_payout,
+        //     enabled_self_payout,
+        //     forced_empty_block,
+        //     contains_preconf,
+        // );
 
         let build_attempt_id: u32 = rand::random();
         let span = info_span!("build_run", build_attempt_id);
@@ -283,7 +282,6 @@ impl OrderingBuilderContext {
 
         let build_start = Instant::now();
 
-        // Create a new ctx to remove builder_signer if necessary
         self.failed_orders.clear();
         self.order_attempts.clear();
         let bottom_preconf_gas = block_orders.get_bottom_preconf_gas();
@@ -297,14 +295,14 @@ impl OrderingBuilderContext {
             bottom_preconf_gas,
             payout_preconf_gas
         );
-        let mut block_building_helper = BlockBuildingHelperFromProvider::new(
+        let mut block_building_helper = BlockBuildingHelperFromProvider::new_with_execution_tracer(
             self.state.clone(),
-            new_ctx,
+            self.ctx.clone(),
             &mut self.local_ctx,
             self.builder_name.clone(),
             self.config.discard_txs,
-            block_orders.orders_statistics(),
             reserved_gas,
+            block_orders.orders_statistics(),
             cancel_block,
             partial_block_execution_tracer,
         )?;
@@ -314,6 +312,8 @@ impl OrderingBuilderContext {
             |_| true,
             build_start,
             self.config.build_duration_deadline(),
+            bottom_preconf_gas,
+            payout_preconf_gas,
         )?;
         add_ordering_builder_base_stage_stats(
             self.builder_name.as_str(),
@@ -352,6 +352,8 @@ impl OrderingBuilderContext {
                     self.config
                         .pre_filtered_build_duration_deadline()
                         .map(|d| build_start.elapsed() + d),
+                    bottom_preconf_gas,
+                    payout_preconf_gas,
                 )?;
                 let considered_stats = block_building_helper
                     .built_block_trace()
@@ -383,10 +385,10 @@ impl OrderingBuilderContext {
         block_building_helper: &mut dyn BlockBuildingHelper,
         block_orders: &mut PrioritizedOrderStore<OrderPriorityType>,
         order_filter: OrderFilter,
-         bottom_preconf_gas: u64,
-        payout_preconf_gas: u64,
         build_start: Instant,
         deadline: Option<Duration>,
+        bottom_preconf_gas: u64,
+        payout_preconf_gas: u64,
     ) -> eyre::Result<()> {
         let mut bottom_preconf: Option<Arc<SimulatedOrder>> = None;
         let mut payout_preconf: Option<Arc<SimulatedOrder>> = None;
@@ -475,18 +477,20 @@ impl OrderingBuilderContext {
         if bottom_preconf.is_some() {
             self.refill_preconf_order(
                 block_building_helper,
-                &mut block_orders,
+                block_orders,
                 bottom_preconf.unwrap(),
                 bottom_preconf_gas,
-            ).expect("bottom preconf order should not fail");
+            )
+            .expect("bottom preconf order should not fail");
         }
         if payout_preconf.is_some() {
             self.refill_preconf_order(
                 block_building_helper,
-                &mut block_orders,
+                block_orders,
                 payout_preconf.unwrap(),
                 payout_preconf_gas,
-            ).expect("payout preconf order should not fail");
+            )
+            .expect("payout preconf order should not fail");
         }
         Ok(())
     }
@@ -518,7 +522,7 @@ impl OrderingBuilderContext {
         let success = commit_result.is_ok();
         match commit_result {
             Ok(res) => {
-                preconf_gas_used = res.gas_used;
+                preconf_gas_used = res.space_used.gas;
                 // This intermediate step is needed until we replace all (Address, u64) for AccountNonce
                 let nonces_updated: Vec<_> = res
                     .nonces_updated

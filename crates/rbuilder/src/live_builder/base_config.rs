@@ -1,17 +1,18 @@
 //! Config should always be deserializable, default values should be used
 //!
 use crate::{
-    preconf::PreconfConfig,
     live_builder::{order_input::OrderInputConfig, LiveBuilder},
+    preconf::PreconfConfig,
     provider::{
         ipc_state_provider::{IpcProviderConfig, IpcStateProviderFactory},
         StateProviderFactory,
     },
     roothash::RootHashContext,
-    utils::tracing::{setup_tracing_subscriber, LoggerConfig},
     utils::{
         constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
-        http_provider, ProviderFactoryReopener, Signer,
+        http_provider,
+        tracing::{setup_tracing_subscriber, LoggerConfig},
+        ProviderFactoryReopener, Signer,
     },
 };
 use alloy_primitives::{Address, B256};
@@ -67,7 +68,7 @@ pub struct BaseConfig {
     pub redacted_telemetry_server_port: u16,
     #[serde(default = "default_ip")]
     pub redacted_telemetry_server_ip: Ipv4Addr,
-    pub log_file_path: Ipv4Addr,
+    pub log_file_path: Option<String>,
     pub log_json: bool,
     log_level: EnvOrValue<String>,
     pub log_color: bool,
@@ -202,6 +203,7 @@ impl BaseConfig {
         };
         let config = LoggerConfig {
             env_filter: log_level,
+            file: log_file_path,
             log_json: self.log_json,
             log_color: self.log_color,
         };
@@ -569,6 +571,7 @@ impl Default for BaseConfig {
             redacted_telemetry_server_ip: default_ip(),
             log_json: false,
             log_level: "info".into(),
+            log_file_path: None,
             log_color: false,
             error_storage_path: None,
             coinbase_secret_key: None,

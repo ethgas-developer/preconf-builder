@@ -12,7 +12,7 @@ use crate::{
     primitives::{Order, OrderId, SimulatedOrder},
     provider::StateProviderFactory,
     telemetry::{add_order_simulation_time, mark_order_pending_nonce},
-    utils::NonceCache,
+    utils::{failed_txs_writer, NonceCache},
 };
 use ahash::{HashMap, HashSet};
 use alloy_primitives::Address;

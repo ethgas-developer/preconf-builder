@@ -84,6 +84,7 @@ async fn main() -> eyre::Result<()> {
 
     let config = LoggerConfig {
         env_filter: cli.rust_log,
+        file: None,
         log_json: cli.log_json,
         log_color: false,
     };

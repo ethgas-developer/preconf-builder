@@ -12,12 +12,15 @@ macro_rules! dynamic_event {
     };
 }
 
+use std::path::PathBuf;
+
 pub use dynamic_event;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone)]
 pub struct LoggerConfig {
     pub env_filter: String,
+    pub file: Option<PathBuf>,
     pub log_json: bool,
     pub log_color: bool,
 }

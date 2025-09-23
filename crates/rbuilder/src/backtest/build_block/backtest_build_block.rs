@@ -84,7 +84,7 @@ where
     let available_orders = orders_source.available_orders();
     let mut order_statistics = OrderStatistics::new();
     for order in &available_orders {
-        order_statistics.add(&order.order);
+        order_statistics.add_order(&order.order);
     }
     println!("Available orders: {}", available_orders.len());
     println!("Order statistics: {order_statistics:?}");

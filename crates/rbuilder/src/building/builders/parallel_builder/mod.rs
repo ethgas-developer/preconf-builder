@@ -418,6 +418,7 @@ where
             builder_name: self.name.clone(),
             cancel: input.cancel,
             built_block_cache: input.built_block_cache,
+            preconf_reserved_gas: input.preconf_reserved_gas,
         };
         run_parallel_builder(live_input, &self.config);
     }

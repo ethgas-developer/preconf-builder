@@ -242,4 +242,8 @@ impl BlockBuildingHelper for BlockBuildingHelperStatsLogger<'_> {
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
         unimplemented!()
     }
+
+    fn deduct_reserve_gas(&mut self, gas: u64) {
+        
+    }
 }

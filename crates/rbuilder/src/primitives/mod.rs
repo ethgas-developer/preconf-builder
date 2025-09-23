@@ -236,10 +236,7 @@ impl Bundle {
     /// Returns `true` if the provided transaction hash is refundable.
     /// This means that part the profit from this execution goes to the self.refund.recipient
     pub fn is_tx_refundable(&self, hash: &B256) -> bool {
-        self.refund
-            .as_ref()
-            .map(|r| r.tx_hashes.contains(hash))
-            .unwrap_or_default()
+        self.refund.as_ref().is_some_and(|r| r.tx_hash == *hash)
     }
 
     fn uuid_v1(&mut self) -> Uuid {
@@ -280,7 +277,11 @@ impl Bundle {
                 + 32
                 + 32 * (self.reverting_tx_hashes.len()
                     + self.dropping_tx_hashes.len()
-                    + self.refund.as_ref().map(|r| r.tx_hashes.len()).unwrap_or(0))
+                    + if self.refund.is_some() {
+                        1usize
+                    } else {
+                        0usize
+                    })
                 + size_of::<char>()
                 + size_of::<Address>(),
         );
@@ -301,11 +302,9 @@ impl Bundle {
         if let Some(refund) = &mut self.refund {
             buff.push(refund.percent);
             buff.extend_from_slice(refund.recipient.as_slice());
-            refund.tx_hashes.sort();
-            buff.append(&mut (refund.tx_hashes.len() as u64).encode_var_vec());
-            for tx_hash in &refund.tx_hashes {
-                buff.extend_from_slice(tx_hash.as_slice());
-            }
+            // We used to allow multiple hashes and encode the len, we keep the 1 to be backwards compatible.
+            buff.append(&mut (1u64).encode_var_vec());
+            buff.extend_from_slice(refund.tx_hash.as_slice());
         }
         Self::uuid_from_buffer(buff)
     }
@@ -1217,6 +1216,9 @@ pub struct SimValue {
     space_used: BlockSpace,
     /// Kickbacks paid during simulation as (receiver, amount)
     paid_kickbacks: Vec<(Address, U256)>,
+    // preconf related fields
+    pub preconf_bid_price: Option<U256>,
+    pub preconf_ordering: Option<U256>,
 }
 
 impl SimValue {
@@ -1238,6 +1240,50 @@ impl SimValue {
             preconf_bid_price,
             preconf_ordering,
         }
+    }
+
+    /// For testing specific coinbase_profit/mev_gas_price values ignoring gas.
+    /// coinbase_profit is the same for full_profit_info/non_mempool_profit_info
+    pub fn new_test_no_gas(coinbase_profit: U256, mev_gas_price: U256) -> Self {
+        Self {
+            full_profit_info: ProfitInfo::new_test(coinbase_profit, mev_gas_price),
+            non_mempool_profit_info: ProfitInfo::new_test(coinbase_profit, mev_gas_price),
+            ..Default::default()
+        }
+    }
+
+    pub fn new_test(full_coinbase_profit: U256, non_mempool_profit: U256, gas_used: u64) -> Self {
+        Self {
+            full_profit_info: ProfitInfo::new(full_coinbase_profit, gas_used),
+            non_mempool_profit_info: ProfitInfo::new(non_mempool_profit, gas_used),
+            space_used: BlockSpace::new(gas_used, 0, 0),
+            ..Default::default()
+        }
+    }
+
+    pub fn full_profit_info(&self) -> &ProfitInfo {
+        &self.full_profit_info
+    }
+
+    pub fn non_mempool_profit_info(&self) -> &ProfitInfo {
+        &self.non_mempool_profit_info
+    }
+
+    pub fn gas_used(&self) -> u64 {
+        self.space_used.gas
+    }
+
+    pub fn blob_gas_used(&self) -> u64 {
+        self.space_used.blob_gas
+    }
+
+    pub fn paid_kickbacks(&self) -> &Vec<(Address, U256)> {
+        &self.paid_kickbacks
+    }
+
+    pub fn with_kickbacks(mut self, kickbacks: Vec<(Address, U256)>) -> Self {
+        self.paid_kickbacks = kickbacks;
+        self
     }
 }
 

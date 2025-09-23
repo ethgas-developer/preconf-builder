@@ -13,10 +13,9 @@ use crate::{
         BlockBuildingSpaceState, BlockSpace,
     },
     primitives::{
-        Bundle, Order, OrderId, RefundConfig, ShareBundle, ShareBundleBody, ShareBundleInner,
-        TransactionSignedEcRecoveredWithBlobs,
+        Bundle, Metadata, Order, OrderId, RefundConfig, ShareBundle, ShareBundleBody, ShareBundleInner, TransactionSignedEcRecoveredWithBlobs
     },
-    utils::{constants::BASE_TX_GAS, get_percent},
+    utils::{constants::BASE_TX_GAS, failed_txs_writer, get_percent},
 };
 use ahash::HashSet;
 use alloy_consensus::{constants::KECCAK_EMPTY, Transaction};
@@ -529,7 +528,6 @@ impl<
         &mut self,
         tx_with_blobs: &TransactionSignedEcRecoveredWithBlobs,
         space_state: BlockBuildingSpaceState,
-        gas_reserved: u64,
     ) -> Result<Result<TransactionOk, TransactionErr>, CriticalCommitOrderError> {
         self.partial_block_fork_execution_tracer
             .update_commit_tx_about_to_execute(tx_with_blobs, space_state);
@@ -706,7 +704,6 @@ impl<
         &mut self,
         bundle: &Bundle,
         space_state: BlockBuildingSpaceState,
-        gas_reserved: u64,
         allow_tx_skip: bool,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
@@ -736,7 +733,12 @@ impl<
         }
 
         self.execute_with_rollback(|s| {
-            s.commit_bundle_no_rollback(bundle, space_state, gas_reserved, allow_tx_skip, combined_refunds)
+            s.commit_bundle_no_rollback(
+                bundle,
+                space_state,
+                allow_tx_skip,
+                combined_refunds,
+            )
         })
     }
 
@@ -834,116 +836,10 @@ impl<
         Ok(Ok(()))
     }
 
-    fn accumulate_tx_execution(transaction_ok: TransactionOk, bundle_ok: &mut BundleOk) {
-        bundle_ok.gas_used += transaction_ok.gas_used;
-        bundle_ok.cumulative_gas_used = transaction_ok.cumulative_gas_used;
-        bundle_ok.blob_gas_used += transaction_ok.blob_gas_used;
-        bundle_ok.cumulative_blob_gas_used = transaction_ok.cumulative_blob_gas_used;
-        bundle_ok.txs.push(transaction_ok.tx);
-        update_nonce_list(&mut bundle_ok.nonces_updated, transaction_ok.nonce_updated);
-        bundle_ok.receipts.push(transaction_ok.receipt);
-    }
-
-    fn estimate_refund_payout_tx(
-        &mut self,
-        to: Address,
-        refundable_value: U256,
-        gas_used: u64,
-    ) -> Result<ReservedPayout, BundleErr> {
-        let gas_limit =
-            match estimate_payout_gas_limit(to, self.ctx, self.local_ctx, self.state, gas_used) {
-                Ok(gas_limit) => gas_limit,
-                Err(err) => {
-                    return Err(BundleErr::EstimatePayoutGas(err));
-                }
-            };
-        let base_fee = U256::from(self.ctx.evm_env.block_env.basefee) * U256::from(gas_limit);
-        if base_fee > refundable_value {
-            return Err(BundleErr::NotEnoughRefundForGas {
-                to,
-                refundable_value,
-                needed_value: base_fee,
-            });
-        }
-        let tx_value = refundable_value - base_fee;
-        Ok(ReservedPayout {
-            gas_limit,
-            tx_value,
-            total_refundable_value: refundable_value,
-        })
-    }
-
-    /// Inserts the payout tx.
-    /// On success insert_result is updated.
-    fn insert_refund_payout_tx(
-        &mut self,
-        payout: ReservedPayout,
-        to: Address,
-        gas_reserved: u64,
-        insert_result: &mut BundleOk,
-    ) -> Result<Result<(), BundleErr>, CriticalCommitOrderError> {
-        let builder_signer = if let Some(signer) = self.ctx.builder_signer.as_ref() {
-            signer
-        } else {
-            return Ok(Err(BundleErr::NoSigner));
-        };
-
-        let nonce = self.state.nonce(
-            builder_signer.address,
-            &self.ctx.shared_cached_reads,
-            &mut self.local_ctx.cached_reads,
-        )?;
-        let payout_tx = match create_payout_tx(
-            self.ctx.chain_spec.as_ref(),
-            self.ctx.evm_env.block_env.basefee,
-            builder_signer,
-            nonce,
-            to,
-            payout.gas_limit,
-            payout.tx_value,
-        ) {
-            // payout tx has no blobs so it's safe to unwrap
-            Ok(tx) => TransactionSignedEcRecoveredWithBlobs::new_no_blobs(tx).unwrap(),
-            Err(err) => {
-                return Ok(Err(BundleErr::PayoutTx(err)));
-            }
-        };
-        let res = self.commit_tx(
-            &payout_tx,
-            insert_result.cumulative_gas_used,
-            gas_reserved,
-            insert_result.cumulative_blob_gas_used,
-        )?;
-        match res {
-            Ok(res) => {
-                if !res.receipt.success {
-                    return Ok(Err(BundleErr::FailedToCommitPayoutTx {
-                        to,
-                        gas_limit: payout.gas_limit,
-                        value: payout.tx_value,
-                        err: None,
-                    }));
-                }
-                Self::accumulate_tx_execution(res, insert_result);
-                insert_result.paid_kickbacks.push((to, payout.tx_value));
-            }
-            Err(err) => {
-                return Ok(Err(BundleErr::FailedToCommitPayoutTx {
-                    to,
-                    gas_limit: payout.gas_limit,
-                    value: payout.tx_value,
-                    err: Some(err),
-                }));
-            }
-        };
-        Ok(Ok(()))
-    }
-
     fn commit_bundle_no_rollback(
         &mut self,
         bundle: &Bundle,
         space_state: BlockBuildingSpaceState,
-        gas_reserved: u64,
         allow_tx_skip: bool,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
@@ -963,8 +859,6 @@ impl<
             let result = self.commit_tx(
                 tx_with_blobs,
                 insert.space_state(space_state.reserved_block_space()),
-                gas_reserved,
-
             )?;
             match result {
                 Ok(res) => {
@@ -1073,7 +967,6 @@ impl<
         &mut self,
         bundle: &ShareBundle,
         space_state: BlockBuildingSpaceState,
-        gas_reserved: u64,
         allow_tx_skip: bool,
     ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
         let current_block = self.ctx.block();
@@ -1085,7 +978,7 @@ impl<
             }));
         }
         self.execute_with_rollback(|s| {
-            s.commit_share_bundle_no_rollback(bundle, gas_reserved, space_state, allow_tx_skip)
+            s.commit_share_bundle_no_rollback(bundle, space_state, allow_tx_skip)
         })
     }
 
@@ -1096,8 +989,11 @@ impl<
         space_state: BlockBuildingSpaceState,
         allow_tx_skip: bool,
     ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
-        let res =
-            self.commit_share_bundle_inner(bundle.inner_bundle(), gas_reserved, space_state, allow_tx_skip)?;
+        let res = self.commit_share_bundle_inner(
+            bundle.inner_bundle(),
+            space_state,
+            allow_tx_skip,
+        )?;
         let res = match res {
             Ok(r) => r,
             Err(e) => {
@@ -1126,11 +1022,14 @@ impl<
         &mut self,
         bundle: &ShareBundleInner,
         space_state: BlockBuildingSpaceState,
-        gas_reserved: u64,
         allow_tx_skip: bool,
     ) -> Result<Result<ShareBundleCommitResult, BundleErr>, CriticalCommitOrderError> {
         self.execute_with_rollback(|s| {
-            s.commit_share_bundle_inner_no_rollback(bundle, space_state, gas_reserved, allow_tx_skip)
+            s.commit_share_bundle_inner_no_rollback(
+                bundle,
+                space_state,
+                allow_tx_skip,
+            )
         })
     }
 
@@ -1138,7 +1037,6 @@ impl<
         &mut self,
         bundle: &ShareBundleInner,
         space_state: BlockBuildingSpaceState,
-        gas_reserved: u64,
         allow_tx_skip: bool,
     ) -> Result<Result<ShareBundleCommitResult, BundleErr>, CriticalCommitOrderError> {
         let mut insert = BundleOk {
@@ -1163,8 +1061,10 @@ impl<
                 ShareBundleBody::Tx(sbundle_tx) => {
                     let rollback_point = self.rollback_point();
                     let tx = &sbundle_tx.tx;
-                    let result =
-                        self.commit_tx(tx, insert.space_state(space_state.reserved_block_space()), gas_reserved)?;
+                    let result = self.commit_tx(
+                        tx,
+                        insert.space_state(space_state.reserved_block_space()),
+                    )?;
                     match result {
                         Ok(res) => {
                             if !res.tx_info.receipt.success {
@@ -1200,7 +1100,6 @@ impl<
                     let inner_res = self.commit_share_bundle_inner(
                         inner_bundle,
                         insert.space_state(space_state.reserved_block_space()),
-                        gas_reserved,
                         allow_tx_skip,
                     )?;
                     match inner_res {
@@ -1311,11 +1210,15 @@ impl<
         order: &Order,
         space_state: BlockBuildingSpaceState,
         allow_tx_skip: bool,
-        gas_reserved: u64,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<OrderOk, OrderErr>, CriticalCommitOrderError> {
         self.execute_with_rollback(|s| {
-            s.commit_order_no_rollback(order, space_state, allow_tx_skip,gas_reserved, combined_refunds)
+            s.commit_order_no_rollback(
+                order,
+                space_state,
+                allow_tx_skip,
+                combined_refunds,
+            )
         })
     }
 
@@ -1323,13 +1226,12 @@ impl<
         &mut self,
         order: &Order,
         space_state: BlockBuildingSpaceState,
-        gas_reserved: u64,
         allow_tx_skip: bool,
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<OrderOk, OrderErr>, CriticalCommitOrderError> {
         match order {
             Order::Tx(tx) => {
-                let res = self.commit_tx(&tx.tx_with_blobs, space_state, gas_reserved,)?;
+                let res = self.commit_tx(&tx.tx_with_blobs, space_state)?;
                 match res {
                     Ok(ok) => {
                         let coinbase_profit = if !ok.tx_info.coinbase_profit.is_negative() {
@@ -1360,12 +1262,12 @@ impl<
                 let coinbase_balance_before = self.coinbase_balance()?;
                 let res =
                     self.commit_bundle(bundle, space_state, allow_tx_skip, combined_refunds)?;
-                self.bundle_to_order_result(res, coinbase_balance_before)
+                self.bundle_to_order_result(res, coinbase_balance_before, &bundle.metadata)
             }
             Order::ShareBundle(bundle) => {
                 let coinbase_balance_before = self.coinbase_balance()?;
                 let res = self.commit_share_bundle(bundle, space_state, allow_tx_skip)?;
-                self.bundle_to_order_result(res, coinbase_balance_before)
+                self.bundle_to_order_result(res, coinbase_balance_before, &bundle.metadata)
             }
         }
     }
@@ -1374,6 +1276,7 @@ impl<
         &mut self,
         bundle_result: Result<BundleOk, BundleErr>,
         coinbase_balance_before: U256,
+        metadata: &Metadata
     ) -> Result<Result<OrderOk, OrderErr>, CriticalCommitOrderError> {
         match bundle_result {
             Ok(ok) => {
@@ -1402,8 +1305,8 @@ impl<
                     delayed_kickback: ok.delayed_kickback,
                     used_state_trace: self.get_used_state_trace(),
                     original_order_ids: ok.original_order_ids,
-                     preconf_bid_price: bundle.metadata.preconf_bid_price,
-                            preconf_ordering: bundle.metadata.preconf_ordering,
+                    preconf_bid_price: metadata.preconf_bid_price,
+                    preconf_ordering: metadata.preconf_ordering,
                 }))
             }
             Err(err) => Ok(Err(err.into())),

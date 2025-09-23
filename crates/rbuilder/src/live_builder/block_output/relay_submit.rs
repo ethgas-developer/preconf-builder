@@ -27,7 +27,7 @@ use reth_chainspec::ChainSpec;
 use std::sync::Arc;
 use tokio::{sync::Notify, time::Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, error_span, info, info_span, trace, warn, Instrument, Span};
+use tracing::{debug, error, error_span, info, info_span, trace, warn, Instrument, Span};
 
 use super::bidding_service_interface::BidObserver;
 
@@ -182,7 +182,7 @@ async fn run_submit_to_relays_job(
                 block.sealed_block.number, block.sealed_block.hash(), block.trace.preconf_bundle_count, format_ether(block.trace.bid_value));
             block.trace.included_orders.iter().for_each(|res| {
                 debug!("result ordering: order id = {}, preconf_ordering = {}, preconf_bid_price = {}, mev_gas_price = {}, coinbase_profit = {}",
-                    res.order.id(), res.inplace_sim.preconf_ordering.unwrap_or(U256::ZERO), format_ether(res.inplace_sim.preconf_bid_price.unwrap_or(U256::ZERO)), format_ether(res.inplace_sim.mev_gas_price), format_ether(res.inplace_sim.coinbase_profit));
+                    res.order.id(), res.inplace_sim.preconf_ordering.unwrap_or(U256::ZERO), format_ether(res.inplace_sim.preconf_bid_price.unwrap_or(U256::ZERO)), format_ether(res.inplace_sim.full_profit_info().mev_gas_price()), format_ether(res.inplace_sim.full_profit_info().coinbase_profit()));
             });
         }
 
@@ -252,7 +252,6 @@ async fn run_submit_to_relays_job(
                 &slot_data.payload_attributes_event.data,
                 slot_data.slot_data.pubkey,
                 block.trace.bid_value,
-                block.trace.fee_recepient,
             ) {
                 Ok((message, signature)) => SignedBuiltBlock {
                     message,

@@ -114,7 +114,6 @@ macro_rules! add_getter {
     };
 }
 
-
 /// Preconf
 struct PreconfOrderingPriorityCmp {}
 impl PreconfOrderingPriorityCmp {
@@ -133,10 +132,10 @@ impl PreconfOrderingPriorityCmp {
 
 struct PreconfBidPricePriorityCmp {}
 impl PreconfBidPricePriorityCmp {
-    // #[inline]
-    // fn eq(a: &SimulatedOrder, b: &SimulatedOrder) -> bool {
-    //     a.sim_value.preconf_bid_price == b.sim_value.preconf_bid_price
-    // }
+    #[inline]
+    fn eq(a: &SimulatedOrder, b: &SimulatedOrder) -> bool {
+        a.sim_value.preconf_bid_price == b.sim_value.preconf_bid_price
+    }
 
     #[inline]
     fn cmp(a: &SimulatedOrder, b: &SimulatedOrder) -> Ordering {
@@ -147,13 +146,16 @@ impl PreconfBidPricePriorityCmp {
 }
 
 #[inline]
-fn simulation_too_low_preconf(original_sim_value: &SimValue, new_sim_value: &SimValue) -> bool {
+fn simulation_too_low_preconf<ProfitInfoGetterType: ProfitInfoGetter>(
+    original_sim_value: &SimValue,
+    new_sim_value: &SimValue,
+) -> bool {
     if new_sim_value.preconf_ordering.is_some() || new_sim_value.preconf_bid_price.is_some() {
         return false;
     }
     new_sim_value_too_low(
-        original_sim_value.mev_gas_price,
-        new_sim_value.mev_gas_price,
+        ProfitInfoGetterType::get_profit_info(original_sim_value).mev_gas_price(),
+        ProfitInfoGetterType::get_profit_info(new_sim_value).mev_gas_price(),
     )
 }
 
@@ -284,7 +286,7 @@ impl OrderIDCmp {
     }
 }
 
-create_order_priority!(OrderMevGasPricePriority((PreconfOrderingPriorityCmp,uses_getter))<simulation_too_low_gas_price>);
+create_order_priority!(PreconfPriority((PreconfOrderingPriorityCmp, plain), (PreconfBidPricePriorityCmp, plain), (OrderMevGasPricePriorityCmp,uses_getter))<simulation_too_low_preconf>);
 create_order_priority!(OrderMevGasPricePriority((OrderMevGasPricePriorityCmp,uses_getter))<simulation_too_low_gas_price>);
 create_order_priority!(OrderMaxProfitPriority((OrderMaxProfitPriorityCmp,uses_getter))<simulation_too_low_profit>);
 create_order_priority!(OrderTypePriority((OrderTypeCmp,plain),(OrderMaxProfitPriorityCmp,uses_getter))<simulation_too_low_profit>);

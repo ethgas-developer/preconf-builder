@@ -1,6 +1,5 @@
 pub mod base_config;
 pub mod block_list_provider;
-pub mod block_list_provider;
 pub mod block_output;
 pub mod building;
 pub mod cli;

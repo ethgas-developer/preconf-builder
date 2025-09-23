@@ -188,7 +188,6 @@ where
         block_data.clone(),
         &available_orders,
         &results_without_exclusion,
-        blocklist.clone(),
     )?;
 
     let time_single_exclusion_s = elapsed_s(start);
@@ -203,7 +202,6 @@ where
         &results_without_exclusion,
         exclusion_results,
         distribute_to_mempool_txs,
-        blocklist.clone(),
     )?;
 
     let time_joint_exclusion_s = elapsed_s(start);
@@ -628,7 +626,6 @@ fn calculate_backtest_without_exclusion<P, ConfigType>(
     provider: P,
     config: &ConfigType,
     block_data: BlockData,
-    blocklist: BlockList,
 ) -> eyre::Result<ResultsWithoutExclusion>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -650,7 +647,6 @@ where
             orders_excluded_before: vec![],
             profit_before: U256::ZERO,
         },
-        blocklist,
     )?;
     Ok(ResultsWithoutExclusion {
         profit,
@@ -697,7 +693,6 @@ fn calculate_backtest_identity_and_order_exclusion<P, ConfigType>(
     block_data: BlockData,
     available_orders: &AvailableOrders,
     results_without_exclusion: &ResultsWithoutExclusion,
-    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -728,7 +723,6 @@ where
                     config,
                     &block_data,
                     results_without_exclusion.exclusion_input(exclusions),
-                    blocklist.clone(),
                 )
                 .map(|ok| (id, ok))
             })
@@ -751,7 +745,6 @@ where
                 config,
                 &block_data,
                 results_without_exclusion.exclusion_input(orders),
-                blocklist.clone(),
             )
             .map(|ok| (address, ok))
         })
@@ -774,7 +767,6 @@ fn calc_joint_exclusion_results<P, ConfigType>(
     results_without_exclusion: &ResultsWithoutExclusion,
     mut exclusion_results: ExclusionResults,
     distribute_to_mempool_txs: bool,
-    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResults>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -842,7 +834,6 @@ where
                 config,
                 &block_data,
                 results_without_exclusion.exclusion_input(orders),
-                blocklist.clone(),
             )
             .map(|ok| ((address1, address2), ok))
         })
@@ -1111,7 +1102,6 @@ fn calc_profit_after_exclusion<P, ConfigType>(
     config: &ConfigType,
     block_data: &BlockData,
     exclusion_input: ExclusionInput,
-    blocklist: BlockList,
 ) -> eyre::Result<ExclusionResult>
 where
     P: StateProviderFactory + Clone + 'static,

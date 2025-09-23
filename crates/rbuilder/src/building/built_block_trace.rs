@@ -2,12 +2,11 @@ use super::ExecutionResult;
 use crate::primitives::{
     order_statistics::OrderStatistics, Order, OrderId, OrderReplacementKey, SimulatedOrder,
 };
-use ahash::{AHasher, AHasher, HashMap, HashSet};
+use ahash::{AHasher, HashMap, HashSet};
 use alloy_primitives::{Address, TxHash, U256};
-use std::{collections::hash_map, hash::Hasher, time::Duration};
-use std::ops::Add;
+use std::{collections::hash_map, hash::Hasher, ops::Add, time::Duration};
 use time::OffsetDateTime;
-use tracing::{trace};
+use tracing::trace;
 
 /// Structs for recording data about a built block, such as what bundles were included, and where txs came from.
 /// Trace can be used to verify bundle invariants.
@@ -104,7 +103,7 @@ impl BuiltBlockTrace {
     pub fn update_orders_sealed_at(&mut self) {
         self.orders_sealed_at = OffsetDateTime::now_utc();
     }
-    
+
     pub fn set_fee_recepient(&mut self, fee_recepient: Address) {
         self.fee_recepient = fee_recepient;
     }
@@ -113,19 +112,22 @@ impl BuiltBlockTrace {
     pub fn add_included_order(&mut self, execution_result: ExecutionResult) {
         if execution_result.order.is_preconf() {
             self.preconf_bundle_count = self.preconf_bundle_count.add(1);
-            trace!("added preconf bundle (id={}) to included orders.", execution_result.order.id());
+            trace!(
+                "added preconf bundle (id={}) to included orders.",
+                execution_result.order.id()
+            );
         }
         self.included_orders.push(execution_result);
     }
 
     /// Call before commit_order
     pub fn add_considered_order(&mut self, sim_order: &SimulatedOrder) {
-        self.considered_orders_statistics.add(&sim_order.order);
+        self.considered_orders_statistics.add_order(&sim_order.order);
     }
 
     /// Call after a commit_order Err
     pub fn add_failed_order(&mut self, sim_order: &SimulatedOrder) {
-        self.failed_orders_statistics.add(&sim_order.order);
+        self.failed_orders_statistics.add_order(&sim_order.order);
     }
 
     // txs, bundles, share bundles

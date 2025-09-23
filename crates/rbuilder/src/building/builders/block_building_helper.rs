@@ -91,7 +91,6 @@ pub trait BlockBuildingHelper: Send + Sync {
         seen_competition_bid: Option<U256>,
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError>;
 
-
     fn deduct_reserve_gas(&mut self, gas: u64);
 }
 
@@ -207,10 +206,10 @@ impl BlockBuildingHelperFromProvider<NullPartialBlockExecutionTracer> {
             local_ctx,
             builder_name,
             discard_txs,
+            preconf_reserved_gas,
             available_orders_statistics,
             cancel_on_fatal_error,
             NullPartialBlockExecutionTracer {},
-            preconf_reserved_gas,
         )
     }
 }
@@ -232,7 +231,7 @@ impl<
         builder_name: String,
         discard_txs: bool,
         preconf_reserved_gas: u64,
-        enforce_sorting: Option<Sorting>,
+        available_orders_statistics: OrderStatistics,
         cancel_on_fatal_error: CancellationToken,
         partial_block_execution_tracer: PartialBlockExecutionTracerType,
     ) -> Result<Self, BlockBuildingHelperError> {
@@ -250,10 +249,9 @@ impl<
             .pre_block_call(&building_ctx, local_ctx, &mut block_state)
             .map_err(|_| BlockBuildingHelperError::PreBlockCallFailed)?;
         let payout_tx_space = estimate_payout_gas_limit(
-            fee_recipient,
+            building_ctx.attributes.suggested_fee_recipient,
             &building_ctx,
             local_ctx,
-                local_ctx,
             &mut block_state,
             BlockSpace::ZERO,
         )?;
@@ -262,14 +260,13 @@ impl<
 
         let mut built_block_trace = BuiltBlockTrace::new();
         built_block_trace.available_orders_statistics = available_orders_statistics;
-        // add preconf reserved gas
-        partial_block.add_reserve_gas(preconf_reserved_gas);
+        // TODO(chirag): add preconf reserved gas
+        // partial_block.add_reserve_gas(preconf_reserved_gas);
         Ok(Self {
             _fee_recipient_balance_start: fee_recipient_balance_start,
             block_state,
             partial_block,
             payout_tx_gas,
-            enabled_self_payout,
             builder_name,
             building_ctx,
             built_block_trace,
@@ -316,22 +313,6 @@ impl<
         );
     }
 
-    fn insert_self_payout_tx(
-        &mut self,
-        local_ctx: &mut ThreadBlockBuildingContext,
-    ) -> Result<(), BlockBuildingHelperError> {
-        match self.partial_block.insert_self_payout_tx(
-            21_000,
-            U256::ZERO,
-            &self.building_ctx,
-            local_ctx,
-            &mut self.block_state,
-        ) {
-            Ok(()) => Ok(()),
-            Err(err) => Err(err.into()),
-        }
-    }
-
     /// Inserts payout tx if necessary and updates built_block_trace.
     fn finalize_block_execution(
         &mut self,
@@ -362,7 +343,7 @@ impl<
         let mut fee_recipient_balance_diff = fee_recipient_balance_after
             .checked_sub(self._fee_recipient_balance_start)
             .unwrap_or_default();
-         if self.built_block_trace.preconf_bundle_count > 0
+        if self.built_block_trace.preconf_bundle_count > 0
             && fee_recipient_balance_diff < U256::ZERO
         {
             // block may contain fee recipient tx that causes the diff to be negative
@@ -532,9 +513,8 @@ impl<
             .get_proposer_payout_tx_value(self.payout_tx_gas, &self.building_ctx)?)
     }
 
-        fn deduct_reserve_gas(&mut self, gas: u64) {
-        self.partial_block.deduct_reserve_gas(gas);
-    }
+    // TODO(chirag)
+    fn deduct_reserve_gas(&mut self, gas: u64) {}
 
     fn finalize_block(
         &mut self,

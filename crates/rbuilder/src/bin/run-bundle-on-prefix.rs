@@ -164,6 +164,7 @@ impl LandedBlockInfo {
             false,
             order_statistics,
             CancellationToken::new(),
+            0,
         )?)
     }
 }

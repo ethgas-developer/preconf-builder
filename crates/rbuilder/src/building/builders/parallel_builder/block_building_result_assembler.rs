@@ -185,6 +185,7 @@ impl BlockBuildingResultAssembler {
             self.discard_txs,
             OrderStatistics::default(),
             self.cancellation_token.clone(),
+            0,
         )?;
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
 
@@ -258,6 +259,7 @@ impl BlockBuildingResultAssembler {
             self.discard_txs,
             OrderStatistics::default(),
             CancellationToken::new(),
+            0,
         )?;
 
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
