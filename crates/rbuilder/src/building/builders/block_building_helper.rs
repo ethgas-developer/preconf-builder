@@ -274,8 +274,7 @@ impl<
 
         let mut built_block_trace = BuiltBlockTrace::new();
         built_block_trace.available_orders_statistics = available_orders_statistics;
-        // TODO(chirag): add preconf reserved gas
-        // partial_block.add_reserve_gas(preconf_reserved_gas);
+        partial_block.reserve_block_space(preconf_reserved_space);
         Ok(Self {
             _fee_recipient_balance_start: fee_recipient_balance_start,
             block_state,

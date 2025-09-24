@@ -146,9 +146,8 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
         let orders = order_intake_consumer.current_block_orders();
         match builder.build_block(
             orders,
-            use_suggested_fee_recipient_as_coinbase,
-            // TODO(chirag)
-            // && input.sink.can_use_suggested_fee_recipient_as_coinbase(),
+            use_suggested_fee_recipient_as_coinbase
+                && input.sink.can_use_suggested_fee_recipient_as_coinbase(),
             input.cancel.clone(),
             input.preconf_reserved_gas,
         ) {

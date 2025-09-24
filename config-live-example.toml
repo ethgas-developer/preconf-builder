@@ -5,9 +5,11 @@ redacted_telemetry_server_ip = "0.0.0.0"
 full_telemetry_server_port = 6060
 full_telemetry_server_ip = "0.0.0.0"
 
+root_hash_use_sparse_trie=true
+root_hash_compare_sparse_trie=false
 
-chain = "mainnet"
-reth_datadir = "/mnt/data/reth"
+chain = "hoodi"
+reth_datadir = "/home/ubuntu/.local/share/reth/hoodi"
 
 coinbase_secret_key = "env:COINBASE_SECRET_KEY"
 relay_secret_key = "env:RELAY_SECRET_KEY"
@@ -20,6 +22,10 @@ jsonrpc_server_port = 8645
 jsonrpc_server_ip = "0.0.0.0"
 el_node_ipc_path = "/tmp/reth.ipc"
 extra_data = "⚡🤖"
+
+preconf_api_url = "url"
+exchange_secret_key = "0x"
+fallback_fee_recipient="0x"
 
 scraped_bids_publisher_url = "tcp://0.0.0.0:5555"
 
