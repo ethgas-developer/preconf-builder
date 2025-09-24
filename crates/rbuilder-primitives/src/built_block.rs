@@ -1,9 +1,6 @@
 use crate::mev_boost::{
-    adjustment::BidAdjustmentData,
-    submission::{
-        CapellaSubmitBlockRequest, DenebSubmitBlockRequest, ElectraSubmitBlockRequest,
-        FuluSubmitBlockRequest, SubmitBlockRequest,
-    },
+    BidAdjustmentData, CapellaSubmitBlockRequest, DenebSubmitBlockRequest,
+    ElectraSubmitBlockRequest, FuluSubmitBlockRequest, SubmitBlockRequest,
 };
 use alloy_eips::{
     eip2718::Encodable2718,

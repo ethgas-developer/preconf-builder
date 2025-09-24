@@ -5,7 +5,7 @@ use crate::preconf::{
     new_preconf_api, new_preconf_ws, PreconfConfig, PreconfHealthStatus, PreconfInfo,
     PreconfReservedInfo, PreconfState,
 };
-use crate::primitives::Order;
+use rbuilder_primitives::Order;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;

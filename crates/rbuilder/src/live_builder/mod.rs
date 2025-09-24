@@ -18,7 +18,6 @@ use crate::{
         watchdog::spawn_watchdog_thread,
     },
     preconf::{PreconfConfig, PreconfInfo},
-    primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
     provider::StateProviderFactory,
     telemetry::{inc_active_slots, mark_building_started, reset_histogram_metrics},
     utils::{
@@ -35,6 +34,7 @@ use eyre::Context;
 use jsonrpsee::RpcModule;
 use order_input::ReplaceableOrderPoolCommand;
 use payload_events::{InternalPayloadId, MevBoostSlotDataGenerator};
+use rbuilder_primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs};
 use reth::transaction_pool::{
     BlobStore, EthPooledTransaction, Pool, TransactionListenerKind, TransactionOrdering,
     TransactionPool, TransactionValidator,
@@ -180,9 +180,9 @@ where
                     self.provider.clone(),
                     self.extra_rpc,
                     self.global_cancellation.clone(),
-                self.orderpool_sender,
-                self.orderpool_receiver,
-                header_receiver,
+                    self.orderpool_sender,
+                    self.orderpool_receiver,
+                    header_receiver,
                 )
                 .await?;
             inner_jobs_handles.push(handle);
@@ -333,14 +333,16 @@ where
                     }
                 };
                 mark_building_started(block_ctx.timestamp());
-                builder_pool.start_block_building(
-                    payload,
-                    block_ctx,
-                    self.global_cancellation.clone(),
-                    time_until_slot_end.try_into().unwrap_or_default(),
-                       &mut preconf_reserved_receiver,
+                builder_pool
+                    .start_block_building(
+                        payload,
+                        block_ctx,
+                        self.global_cancellation.clone(),
+                        time_until_slot_end.try_into().unwrap_or_default(),
+                        &mut preconf_reserved_receiver,
                         &preconf_state_handler,
-                );
+                    )
+                    .await;
                 if let Some(watchdog_sender) = watchdog_sender.as_ref() {
                     watchdog_sender.try_send(()).unwrap_or_default();
                 };

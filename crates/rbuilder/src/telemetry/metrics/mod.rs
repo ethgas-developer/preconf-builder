@@ -9,7 +9,6 @@
 use crate::{
     building::BuiltBlockTrace,
     live_builder::block_list_provider::{blocklist_hash, BlockList},
-    primitives::mev_boost::MevBoostRelayID,
     utils::{build_info::Version, duration_ms},
 };
 use alloy_consensus::constants::GWEI_TO_WEI;
@@ -24,6 +23,7 @@ use prometheus::{
     Counter, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
     Opts, Registry,
 };
+use rbuilder_primitives::mev_boost::MevBoostRelayID;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -363,6 +363,13 @@ register_metrics! {
     pub static BLOCK_SEAL_END_SUBMIT_START_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_seal_end_submit_start_time", "Time between when the block sealed ended and the block submission started. (ms)")
             .buckets(exponential_buckets_range(0.01, 500.0, 300)),
+        &[]
+    )
+    .unwrap();
+
+    pub static TRIGGER_TO_BID_ROUND_TRIP_TIME: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("trigger_to_bid_round_trip_time_us", "Time (in microseconds) it takes from a trigger (new block or competition bid) to get a new bid to make")
+            .buckets(linear_buckets_range(50.0, 4000.0, 200)),
         &[]
     )
     .unwrap();
@@ -800,4 +807,10 @@ pub fn add_ordering_builder_pre_filtered_stage_stats(
     ratio: OrderInclusionRatio,
 ) {
     add_ordering_builder_orders_executed(builder_name, BUILDING_STEP_PRE_FILTERED, ratio);
+}
+
+pub fn add_trigger_to_bid_round_trip_time(duration: time::Duration) {
+    TRIGGER_TO_BID_ROUND_TRIP_TIME
+        .with_label_values(&[])
+        .observe(duration.as_seconds_f64() * 1_000_000.0);
 }

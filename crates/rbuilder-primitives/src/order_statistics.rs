@@ -1,4 +1,4 @@
-use crate::primitives::Order;
+use crate::Order;
 use std::ops::{Add, Sub};
 
 /// Simple struct to count orders by type.

@@ -28,12 +28,13 @@ use crate::{
             BiddableUnfinishedBlock, BlockBuildingHelper, BlockBuildingHelperError,
             FinalizeBlockResult,
         },
-        ThreadBlockBuildingContext,
+        InsertPayoutTxErr, ThreadBlockBuildingContext,
     },
     live_builder::{
         payload_events::MevBoostSlotData, wallet_balance_watcher::WalletBalanceWatcher,
     },
     provider::StateProviderFactory,
+    telemetry::add_trigger_to_bid_round_trip_time,
 };
 
 use super::{
@@ -223,7 +224,7 @@ pub struct UnfinishedBuiltBlocksInput {
 
     cancellation_token: CancellationToken,
     #[derivative(Debug = "ignore")]
-    block_building_sink: Arc<Mutex<Box<dyn BlockBuildingSink>>>,
+    block_building_sink: Arc<dyn BlockBuildingSink>,
     adjust_finalized_blocks: bool,
 }
 
@@ -243,7 +244,7 @@ impl UnfinishedBuiltBlocksInput {
             finalized_blocks: Arc::new(Mutex::new(Vec::new())),
             last_finalize_command: Arc::new((Mutex::new(None), Condvar::new())),
             cancellation_token,
-            block_building_sink: Arc::new(Mutex::new(block_building_sink)),
+            block_building_sink: block_building_sink.into(),
             adjust_finalized_blocks,
         }
     }
@@ -277,6 +278,12 @@ impl UnfinishedBuiltBlocksInput {
     fn seal_command(&self, bid: SlotBidderSealBidCommand) {
         let id_span = tracing::info_span!("block_id", block_id = bid.block_id.0);
         let _guard_id_span = id_span.enter();
+
+        if let Some(trigger_creation_time) = bid.trigger_creation_time {
+            let now = time::OffsetDateTime::now_utc();
+            let roundtrip = now - trigger_creation_time;
+            add_trigger_to_bid_round_trip_time(roundtrip);
+        }
 
         trace!(?bid, "Received seal command");
 
@@ -369,15 +376,18 @@ impl UnfinishedBuiltBlocksInput {
             let mut local_ctx = self.local_ctx();
             let mut block_building_helper = next_block.into_building_helper();
             if self.adjust_finalized_blocks {
-                let value = if block_building_helper
-                    .true_block_value()
-                    .unwrap_or_default()
-                    .is_zero()
-                {
-                    U256::ZERO
-                } else {
-                    // set value to 1 so that some contracts do not revert
-                    U256::ONE
+                let value = match block_building_helper.true_block_value() {
+                    Ok(value) => value,
+                    Err(BlockBuildingHelperError::InsertPayoutTxErr(
+                        InsertPayoutTxErr::ProfitTooLow,
+                    )) => {
+                        trace!("Block profit is too low");
+                        continue;
+                    }
+                    Err(err) => {
+                        error!(?err, "Failed to get block true value");
+                        continue;
+                    }
                 };
                 match block_building_helper.finalize_block(&mut local_ctx, value, None) {
                     Ok(_) => {
@@ -449,11 +459,16 @@ impl UnfinishedBuiltBlocksInput {
                     continue;
                 }
                 Err(err) => {
+                    // remove this block from a list of prefinalized blocks as it can be inconsistent
+                    self.finalized_blocks.lock().retain(|block| {
+                        block.block_id != finalize_command.prefinalized_block.block_id
+                    });
+
                     error!(?err, "Failed to finalize prefinalized block");
                     continue;
                 }
             };
-            self.block_building_sink.lock().new_block(result.block);
+            self.block_building_sink.new_block(result.block);
         }
     }
 }

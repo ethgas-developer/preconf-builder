@@ -6,9 +6,14 @@ use crate::{
         builders::{BlockBuildingAlgorithm, BlockBuildingAlgorithmInput},
         multi_share_bundle_merger::MultiShareBundleMerger,
         simulated_order_command_to_sink, BlockBuildingContext, SimulatedOrderSink,
-    }, live_builder::{building::built_block_cache::BuiltBlockCache, order_input::{preconf_fetcher::PRECONF_RECEIVER_TIMEOUT_PERIOD, replaceable_order_sink::ReplaceableOrderSink}, payload_events::MevBoostSlotData, simulation::SlotOrderSimResults}, preconf::{PreconfReservedInfo, PreconfState}, primitives::{OrderId, SimulatedOrder}, provider::StateProviderFactory
+    }, live_builder::{
+        building::built_block_cache::BuiltBlockCache,
+        order_input::{preconf_fetcher::PRECONF_RECEIVER_TIMEOUT_PERIOD, replaceable_order_sink::ReplaceableOrderSink},
+        payload_events::MevBoostSlotData, simulation::SlotOrderSimResults,
+    }, preconf::{PreconfReservedInfo, PreconfState}, provider::StateProviderFactory
 };
 use alloy_primitives::Address;
+use rbuilder_primitives::{OrderId, SimulatedOrder};
 use reth_chainspec::EthereumHardforks as _;
 use std::{cell::RefCell, rc::Rc, sync::Arc, thread, time::Duration};
 use tokio::{sync::{broadcast, mpsc, watch}, time::timeout};

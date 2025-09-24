@@ -6,15 +6,7 @@ use super::{
     BlockBuildingContext, EstimatePayoutGasErr, ThreadBlockBuildingContext,
 };
 use crate::{
-    building::{
-        estimate_payout_gas_limit,
-        evm::EvmFactory,
-        evm_inspector::{RBuilderEVMInspector, UsedStateTrace},
-        BlockBuildingSpaceState, BlockSpace,
-    },
-    primitives::{
-        Bundle, Metadata, Order, OrderId, RefundConfig, ShareBundle, ShareBundleBody, ShareBundleInner, TransactionSignedEcRecoveredWithBlobs
-    },
+    building::{estimate_payout_gas_limit, evm::EvmFactory, BlockBuildingSpaceState},
     utils::{constants::BASE_TX_GAS, failed_txs_writer, get_percent},
 };
 use ahash::HashSet;
@@ -23,6 +15,11 @@ use alloy_evm::Database;
 use alloy_primitives::{Address, B256, I256, U256};
 use alloy_rlp::Encodable;
 use itertools::Itertools;
+use rbuilder_primitives::{
+    evm_inspector::{RBuilderEVMInspector, UsedStateTrace},
+    BlockSpace, Bundle, Metadata, Order, OrderId, RefundConfig, ShareBundle, ShareBundleBody,
+    ShareBundleInner, TransactionSignedEcRecoveredWithBlobs,
+};
 use reth::{
     consensus_common::validation::MAX_RLP_BLOCK_SIZE, revm::database::StateProviderDatabase,
 };
@@ -142,6 +139,22 @@ impl BlockState {
             .basic(address)?
             .map(|acc| acc.code_hash)
             .unwrap_or_else(|| KECCAK_EMPTY))
+    }
+
+    /// Get accounts that were changed for the last `num_reverts` revert.
+    /// Revert is created after .merge_transitions(BundleRetention::Reverts) is called
+    /// on the EVM database object
+    pub fn get_changes_for_last_reverts(&self, num_reverts: usize) -> Vec<Address> {
+        let mut result = Vec::new();
+        self.bundle_state()
+            .reverts
+            .iter()
+            .rev()
+            .take(num_reverts)
+            .for_each(|r| r.iter().for_each(|c| result.push(c.0)));
+        result.sort();
+        result.dedup();
+        result
     }
 }
 
@@ -733,12 +746,7 @@ impl<
         }
 
         self.execute_with_rollback(|s| {
-            s.commit_bundle_no_rollback(
-                bundle,
-                space_state,
-                allow_tx_skip,
-                combined_refunds,
-            )
+            s.commit_bundle_no_rollback(bundle, space_state, allow_tx_skip, combined_refunds)
         })
     }
 
@@ -989,11 +997,8 @@ impl<
         space_state: BlockBuildingSpaceState,
         allow_tx_skip: bool,
     ) -> Result<Result<BundleOk, BundleErr>, CriticalCommitOrderError> {
-        let res = self.commit_share_bundle_inner(
-            bundle.inner_bundle(),
-            space_state,
-            allow_tx_skip,
-        )?;
+        let res =
+            self.commit_share_bundle_inner(bundle.inner_bundle(), space_state, allow_tx_skip)?;
         let res = match res {
             Ok(r) => r,
             Err(e) => {
@@ -1025,11 +1030,7 @@ impl<
         allow_tx_skip: bool,
     ) -> Result<Result<ShareBundleCommitResult, BundleErr>, CriticalCommitOrderError> {
         self.execute_with_rollback(|s| {
-            s.commit_share_bundle_inner_no_rollback(
-                bundle,
-                space_state,
-                allow_tx_skip,
-            )
+            s.commit_share_bundle_inner_no_rollback(bundle, space_state, allow_tx_skip)
         })
     }
 
@@ -1061,19 +1062,17 @@ impl<
                 ShareBundleBody::Tx(sbundle_tx) => {
                     let rollback_point = self.rollback_point();
                     let tx = &sbundle_tx.tx;
-                    let result = self.commit_tx(
-                        tx,
-                        insert.space_state(space_state.reserved_block_space()),
-                    )?;
+                    let result =
+                        self.commit_tx(tx, insert.space_state(space_state.reserved_block_space()))?;
                     match result {
                         Ok(res) => {
                             if !res.tx_info.receipt.success {
                                 match sbundle_tx.revert_behavior {
-                                    crate::primitives::TxRevertBehavior::NotAllowed => {
+                                    rbuilder_primitives::TxRevertBehavior::NotAllowed => {
                                         return Ok(Err(BundleErr::TransactionReverted(tx.hash())));
                                     }
-                                    crate::primitives::TxRevertBehavior::AllowedIncluded => {}
-                                    crate::primitives::TxRevertBehavior::AllowedExcluded => {
+                                    rbuilder_primitives::TxRevertBehavior::AllowedIncluded => {}
+                                    rbuilder_primitives::TxRevertBehavior::AllowedExcluded => {
                                         self.rollback(rollback_point);
                                         continue;
                                     }
@@ -1213,12 +1212,7 @@ impl<
         combined_refunds: &HashMap<Address, U256>,
     ) -> Result<Result<OrderOk, OrderErr>, CriticalCommitOrderError> {
         self.execute_with_rollback(|s| {
-            s.commit_order_no_rollback(
-                order,
-                space_state,
-                allow_tx_skip,
-                combined_refunds,
-            )
+            s.commit_order_no_rollback(order, space_state, allow_tx_skip, combined_refunds)
         })
     }
 
@@ -1276,7 +1270,7 @@ impl<
         &mut self,
         bundle_result: Result<BundleOk, BundleErr>,
         coinbase_balance_before: U256,
-        metadata: &Metadata
+        metadata: &Metadata,
     ) -> Result<Result<OrderOk, OrderErr>, CriticalCommitOrderError> {
         match bundle_result {
             Ok(ok) => {

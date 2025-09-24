@@ -35,10 +35,9 @@ use crate::{
     live_builder::{
         base_config::EnvOrValue, cli::LiveBuilderConfig, payload_events::MevBoostSlotDataGenerator,
     },
-    mev_boost::{bloxroute_grpc, BLSBlockSigner, RelayClient},
-    primitives::mev_boost::{
-        MevBoostRelayBidSubmitter, MevBoostRelayID, MevBoostRelaySlotInfoProvider, RelayConfig,
-        RelayMode, RelaySubmitConfig,
+    mev_boost::{
+        bloxroute_grpc, BLSBlockSigner, MevBoostRelayBidSubmitter, MevBoostRelaySlotInfoProvider,
+        RelayClient, RelayConfig, RelaySubmitConfig,
     },
     provider::StateProviderFactory,
     roothash::RootHashContext,
@@ -56,6 +55,7 @@ use ethereum_consensus::{
 };
 use eyre::Context;
 use lazy_static::lazy_static;
+use rbuilder_primitives::mev_boost::{MevBoostRelayID, RelayMode};
 use reth_chainspec::{Chain, ChainSpec, NamedChain};
 use reth_db::DatabaseEnv;
 use reth_node_api::NodeTypesWithDBAdapter;

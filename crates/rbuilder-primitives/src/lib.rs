@@ -1,6 +1,7 @@
 //! Order types used as elements for block building.
 
 pub mod built_block;
+pub mod evm_inspector;
 pub mod fmt;
 pub mod mev_boost;
 pub mod order_builder;
@@ -8,10 +9,6 @@ pub mod order_statistics;
 pub mod serialize;
 mod test_data_generator;
 
-use crate::{
-    building::{evm_inspector::UsedStateTrace, BlockSpace},
-    preconf::PreconfOrdering,
-};
 use alloy_consensus::Transaction as _;
 use alloy_eips::{
     eip2718::{Decodable2718, Eip2718Error, Encodable2718},
@@ -22,6 +19,7 @@ use alloy_eips::{
 use alloy_primitives::{keccak256, Address, Bytes, TxHash, B256, U256};
 use alloy_rlp::Encodable as _;
 use derivative::Derivative;
+use evm_inspector::UsedStateTrace;
 use integer_encoding::VarInt;
 use reth::transaction_pool::{
     BlobStore, BlobStoreError, EthPooledTransaction, Pool, TransactionOrdering, TransactionPool,
@@ -562,7 +560,6 @@ impl ShareBundle {
         sbundle
     }
 
-    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_fake_hash(
         hash: B256,
@@ -588,7 +585,6 @@ impl ShareBundle {
         }
     }
 
-    #[cfg(test)]
     pub fn with_inner_bundle(self, inner_bundle: ShareBundleInner) -> Self {
         Self::new(
             self.block,
@@ -1438,6 +1434,68 @@ fn can_execute_with_block_base_fee<Transaction: AsRef<TransactionSigned>>(
         }
     }
     executable_tx_count > 0
+}
+
+/// Models consumed/reserved space on a block to be able to insert payout tx when finished filling the block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct BlockSpace {
+    pub gas: u64,
+    /// EIP-7934 limits the size of the final rlp block.
+    /// Estimation of the sum of the rlp txs sizes.
+    pub rlp_length: usize,
+    pub blob_gas: u64,
+}
+
+impl BlockSpace {
+    pub fn new(gas: u64, rlp_length: usize, blob_gas: u64) -> Self {
+        Self {
+            gas,
+            rlp_length,
+            blob_gas,
+        }
+    }
+
+    pub const ZERO: Self = Self {
+        gas: 0,
+        rlp_length: 0,
+        blob_gas: 0,
+    };
+}
+
+impl std::ops::AddAssign for BlockSpace {
+    fn add_assign(&mut self, other: Self) {
+        self.gas += other.gas;
+        self.rlp_length += other.rlp_length;
+        self.blob_gas += other.blob_gas;
+    }
+}
+
+impl std::ops::Add for BlockSpace {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            gas: self.gas + other.gas,
+            rlp_length: self.rlp_length + other.rlp_length,
+            blob_gas: self.blob_gas + other.blob_gas,
+        }
+    }
+}
+
+impl std::ops::SubAssign for BlockSpace {
+    fn sub_assign(&mut self, other: Self) {
+        self.gas = self.gas.checked_sub(other.gas).unwrap();
+        self.rlp_length = self.rlp_length.checked_sub(other.rlp_length).unwrap();
+        self.blob_gas = self.blob_gas.checked_sub(other.blob_gas).unwrap();
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum PreconfOrdering {
+    TopPreconf = 4,
+    BottomPreconf = 3,
+    RegularPreconf = 2,
+    PayoutPreconf = 1,
 }
 
 #[cfg(test)]
