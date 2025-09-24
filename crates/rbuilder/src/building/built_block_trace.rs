@@ -1,4 +1,4 @@
-use super::ExecutionResult;
+use super::{BundleErr, ExecutionError, ExecutionResult, OrderErr};
 use ahash::{AHasher, HashMap, HashSet};
 use alloy_primitives::{Address, TxHash, U256};
 use rbuilder_primitives::{
@@ -20,6 +20,8 @@ pub struct BuiltBlockTrace {
     pub coinbase_reward: U256,
     /// True block value (coinbase balance delta) excluding the cost of the payout to validator
     pub true_bid_value: U256,
+    /// Some bundle failed with BundleErr::NoSigner, we might want to switch to !use_suggested_fee_recipient_as_coinbase
+    pub got_no_signer_error: bool,
     /// Timestamp of the moment we stopped considering new orders for this block.
     pub orders_closed_at: OffsetDateTime,
     /// Timestamp when this block was fully sealed and ready for submission.
@@ -71,6 +73,7 @@ impl BuiltBlockTrace {
             bid_value: U256::from(0),
             coinbase_reward: U256::from(0),
             true_bid_value: U256::from(0),
+            got_no_signer_error: false,
             orders_closed_at: OffsetDateTime::now_utc(),
             orders_sealed_at: OffsetDateTime::now_utc(),
             fill_time: Duration::from_secs(0),
@@ -128,6 +131,13 @@ impl BuiltBlockTrace {
     /// Call after a commit_order Err
     pub fn add_failed_order(&mut self, sim_order: &SimulatedOrder) {
         self.failed_orders_statistics.add(&sim_order.order);
+    }
+
+    /// Call after a commit_order error
+    pub fn modify_payment_when_no_signer_error(&mut self, err: &ExecutionError) {
+        if let ExecutionError::OrderError(OrderErr::Bundle(BundleErr::NoSigner)) = err {
+            self.got_no_signer_error = true
+        }
     }
 
     // txs, bundles, share bundles

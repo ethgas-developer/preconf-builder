@@ -11,7 +11,10 @@
 ///
 /// Alternatively if configured (adjust_finalized_blocks = true) to run using old flow `prefinalize_worker` would not do anything with the block
 /// and `finalize_worker` would do full finalization instead of adjustment of the finalize block.
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 
 use alloy_primitives::{utils::format_ether, U256};
 use derivative::Derivative;
@@ -157,7 +160,7 @@ struct PrefinalizedBlockInner {
 impl PrefinalizedBlockInner {
     fn finalize_block(
         &mut self,
-        value: U256,
+        value: Option<U256>,
         seen_competition_bid: Option<U256>,
         adjust_finalized_blocks: bool,
     ) -> Result<Option<FinalizeBlockResult>, BlockBuildingHelperError> {
@@ -202,7 +205,7 @@ impl PrefinalizedBlock {
 #[derive(Debug)]
 struct FinalizeCommand {
     prefinalized_block: PrefinalizedBlock,
-    value: U256,
+    value: Option<U256>,
     seen_competition_bid: Option<U256>,
 }
 
@@ -226,6 +229,9 @@ pub struct UnfinishedBuiltBlocksInput {
     #[derivative(Debug = "ignore")]
     block_building_sink: Arc<dyn BlockBuildingSink>,
     adjust_finalized_blocks: bool,
+
+    /// bidding service sets this value
+    can_use_suggested_fee_recipient_as_coinbase: Arc<AtomicBool>,
 }
 
 impl UnfinishedBuiltBlocksInput {
@@ -246,6 +252,7 @@ impl UnfinishedBuiltBlocksInput {
             cancellation_token,
             block_building_sink: block_building_sink.into(),
             adjust_finalized_blocks,
+            can_use_suggested_fee_recipient_as_coinbase: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -321,6 +328,11 @@ impl UnfinishedBuiltBlocksInput {
             warn!("Seal command discarded, prefinalized block was not found");
         }
     }
+
+    pub fn can_use_suggested_fee_recipient_as_coinbase(&self) -> bool {
+        self.can_use_suggested_fee_recipient_as_coinbase
+            .load(Ordering::Relaxed)
+    }
 }
 
 // prefinalize_worker
@@ -377,7 +389,7 @@ impl UnfinishedBuiltBlocksInput {
             let mut block_building_helper = next_block.into_building_helper();
             if self.adjust_finalized_blocks {
                 let value = match block_building_helper.true_block_value() {
-                    Ok(value) => value,
+                    Ok(value) => Some(value),
                     Err(BlockBuildingHelperError::InsertPayoutTxErr(
                         InsertPayoutTxErr::ProfitTooLow,
                     )) => {
@@ -476,6 +488,11 @@ impl UnfinishedBuiltBlocksInput {
 impl BlockSealInterfaceForSlotBidder for UnfinishedBuiltBlocksInput {
     fn seal_bid(&self, bid: SlotBidderSealBidCommand) {
         self.seal_command(bid)
+    }
+
+    fn set_can_use_suggested_fee_recipient_as_coinbase(&self, value: bool) {
+        self.can_use_suggested_fee_recipient_as_coinbase
+            .store(value, Ordering::Relaxed);
     }
 }
 

@@ -1,5 +1,4 @@
 use ahash::HashMap;
-use alloy_eips::merge::SLOT_DURATION;
 use lru::LruCache;
 use rbuilder_primitives::{
     serialize::CancelShareBundle, BundleReplacementData, Order, OrderId, ShareBundleReplacementKey,

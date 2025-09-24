@@ -157,13 +157,16 @@ async fn run_submit_to_relays_job(
                 last_bid_hash = Some(new_block.sealed_block.hash());
                 last_preconf_bundle_count = new_block.trace.preconf_bundle_count;
                 new_block
+            } else if new_block.trace.preconf_bundle_count >= last_preconf_bundle_count {
+                last_preconf_bundle_count = new_block.trace.preconf_bundle_count;
+                last_bid_hash = Some(new_block.sealed_block.hash());
+                new_block
             } else {
                 continue 'submit;
             }
         } else {
             continue 'submit;
         };
-
         res = Some(BuiltBlockInfo {
             bid_value: block.trace.bid_value,
             true_bid_value: block.trace.true_bid_value,

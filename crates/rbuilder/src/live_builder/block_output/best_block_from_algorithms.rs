@@ -69,7 +69,7 @@ mod tests {
             true_block_value: U256,
             builder_name: &str,
         ) -> BiddableUnfinishedBlock {
-            let mut block = MockBlockBuildingHelper::new(true_block_value)
+            let mut block = MockBlockBuildingHelper::new(true_block_value, false)
                 .with_builder_name(builder_name.to_string());
             let order = self.base.create_mempool_tx(AccountNonce::default());
             let tx = order.tx_with_blobs.clone();

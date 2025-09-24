@@ -60,6 +60,10 @@ pub struct OrderingBuilderConfig {
     pub failed_order_retries: usize,
     /// if a tx fails in a block building iteration it's dropped so next iterations will not use it.
     pub drop_failed_orders: bool,
+    /// Start the first iteration of block building using direct pay to fee_recipient (validator)
+    /// This mode saves gas on the payout tx from builder to validator but disables mev-share and profit taking.
+    #[serde(default)]
+    pub coinbase_payment: bool,
     /// Amount of time allocated for EVM execution while building block.
     #[serde(default)]
     pub build_duration_deadline_ms: Option<u64>,
@@ -121,6 +125,7 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
 
     // this is a hack to mark used orders until built block trace is implemented as a sane thing
     let mut removed_orders = Vec::new();
+    let mut use_suggested_fee_recipient_as_coinbase = config.coinbase_payment;
     'building: loop {
         if input.cancel.is_cancelled() {
             break 'building;
@@ -139,8 +144,18 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
         }
 
         let orders = order_intake_consumer.current_block_orders();
-        match builder.build_block(orders, input.cancel.clone(), input.preconf_reserved_gas) {
+        match builder.build_block(
+            orders,
+            use_suggested_fee_recipient_as_coinbase,
+            // TODO(chirag)
+            // && input.sink.can_use_suggested_fee_recipient_as_coinbase(),
+            input.cancel.clone(),
+            input.preconf_reserved_gas,
+        ) {
             Ok(block) => {
+                if block.built_block_trace().got_no_signer_error {
+                    use_suggested_fee_recipient_as_coinbase = false;
+                }
                 if let Ok(block) = BiddableUnfinishedBlock::new(block) {
                     input.sink.new_block(block);
                 }
@@ -170,6 +185,7 @@ pub fn backtest_simulate_block<
 where
     P: StateProviderFactory + Clone + 'static,
 {
+    let use_suggested_fee_recipient_as_coinbase = ordering_config.coinbase_payment;
     let state_provider = input
         .provider
         .history_by_block_number(input.ctx.block() - 1)?;
@@ -187,12 +203,17 @@ where
     );
     let mut block_builder = builder.build_block_with_execution_tracer(
         block_orders,
+        use_suggested_fee_recipient_as_coinbase,
         CancellationToken::new(),
         partial_block_execution_tracer,
         preconf_reserved_gas,
     )?;
 
-    let payout_tx_value = block_builder.true_block_value()?;
+    let payout_tx_value = if use_suggested_fee_recipient_as_coinbase {
+        None
+    } else {
+        Some(block_builder.true_block_value()?)
+    };
     let finalize_block_result =
         block_builder.finalize_block(&mut local_ctx, payout_tx_value, None)?;
     Ok(finalize_block_result.block)
@@ -239,11 +260,13 @@ impl OrderingBuilderContext {
     pub fn build_block<OrderPriorityType: OrderPriority>(
         &mut self,
         block_orders: PrioritizedOrderStore<OrderPriorityType>,
+        use_suggested_fee_recipient_as_coinbase: bool,
         cancel_block: CancellationToken,
         preconf_reserved_space: BlockSpace,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         self.build_block_with_execution_tracer(
             block_orders,
+            use_suggested_fee_recipient_as_coinbase,
             cancel_block,
             NullPartialBlockExecutionTracer {},
             preconf_reserved_space,
@@ -259,6 +282,7 @@ impl OrderingBuilderContext {
     >(
         &mut self,
         mut block_orders: PrioritizedOrderStore<OrderPriorityType>,
+        use_suggested_fee_recipient_as_coinbase: bool,
         cancel_block: CancellationToken,
         partial_block_execution_tracer: PartialBlockExecutionTracerType,
         preconf_reserved_space: BlockSpace,
@@ -283,6 +307,11 @@ impl OrderingBuilderContext {
 
         let build_start = Instant::now();
 
+        // Create a new ctx to remove builder_signer if necessary
+        let mut new_ctx = self.ctx.clone();
+        if use_suggested_fee_recipient_as_coinbase {
+            new_ctx.modify_use_suggested_fee_recipient_as_coinbase();
+        }
         self.failed_orders.clear();
         self.order_attempts.clear();
         let bottom_preconf_space = block_orders.get_bottom_preconf_space();
@@ -298,7 +327,7 @@ impl OrderingBuilderContext {
         );
         let mut block_building_helper = BlockBuildingHelperFromProvider::new_with_execution_tracer(
             self.state.clone(),
-            self.ctx.clone(),
+            new_ctx,
             &mut self.local_ctx,
             self.builder_name.clone(),
             self.config.discard_txs,

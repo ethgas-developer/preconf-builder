@@ -14,7 +14,7 @@ use rbuilder::{
     },
     live_builder::{base_config::load_config_toml_and_env, cli::LiveBuilderConfig, config::Config},
     provider::StateProviderFactory,
-    utils::{extract_onchain_block_txs, find_suggested_fee_recipient, http_provider, Signer},
+    utils::{extract_onchain_block_txs, find_suggested_fee_recipient, http_provider},
 };
 use rbuilder_primitives::mev_boost::SubmitBlockRequest;
 use reth_primitives_traits::SignerRecoverable;
@@ -90,7 +90,7 @@ async fn main() -> eyre::Result<()> {
         Default::default(),
         coinbase,
         suggested_fee_recipient,
-        Signer::random(),
+        None,
         Arc::from(provider_factory.root_hasher(parent_num_hash)?),
         config.base_config().evm_caching_enable,
     );

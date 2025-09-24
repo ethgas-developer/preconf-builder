@@ -136,7 +136,7 @@ impl LandedBlockInfo {
             Default::default(),
             coinbase,
             suggested_fee_recipient,
-            signer,
+            Some(signer),
             Arc::new(MockRootHasher {}),
             false,
         ))
