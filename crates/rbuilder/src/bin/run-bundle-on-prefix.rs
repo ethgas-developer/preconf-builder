@@ -21,8 +21,7 @@ use rbuilder::{
     utils::{extract_onchain_block_txs, find_suggested_fee_recipient},
 };
 use rbuilder_primitives::{
-    order_statistics::OrderStatistics, MempoolTx, Order, SimValue, SimulatedOrder,
-    TransactionSignedEcRecoveredWithBlobs,
+    order_statistics::OrderStatistics, BlockSpace, MempoolTx, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs
 };
 use std::{
     path::{Path, PathBuf},
@@ -164,7 +163,7 @@ impl LandedBlockInfo {
             false,
             order_statistics,
             CancellationToken::new(),
-            0,
+            BlockSpace::ZERO,
         )?)
     }
 }

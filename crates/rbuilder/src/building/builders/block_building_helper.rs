@@ -92,7 +92,7 @@ pub trait BlockBuildingHelper: Send + Sync {
         seen_competition_bid: Option<U256>,
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError>;
 
-    fn deduct_reserve_gas(&mut self, gas: u64);
+    fn deduct_reserved_space(&mut self, space: BlockSpace);
 }
 
 /// Wraps a BlockBuildingHelper with a valid true_block_value which makes it ready to bid.
@@ -199,7 +199,7 @@ impl BlockBuildingHelperFromProvider<NullPartialBlockExecutionTracer> {
         discard_txs: bool,
         available_orders_statistics: OrderStatistics,
         cancel_on_fatal_error: CancellationToken,
-        preconf_reserved_gas: u64,
+        preconf_reserved_gas: BlockSpace,
     ) -> Result<Self, BlockBuildingHelperError> {
         BlockBuildingHelperFromProvider::new_with_execution_tracer(
             state_provider,
@@ -231,7 +231,7 @@ impl<
         local_ctx: &mut ThreadBlockBuildingContext,
         builder_name: String,
         discard_txs: bool,
-        preconf_reserved_gas: u64,
+        preconf_reserved_space: BlockSpace,
         available_orders_statistics: OrderStatistics,
         cancel_on_fatal_error: CancellationToken,
         partial_block_execution_tracer: PartialBlockExecutionTracerType,
@@ -257,6 +257,9 @@ impl<
             BlockSpace::ZERO,
         )?;
         partial_block.reserve_block_space(payout_tx_space);
+
+        // add preconf reserved gas
+        partial_block.reserve_block_space(preconf_reserved_space);
         let payout_tx_gas = payout_tx_space.gas;
 
         let mut built_block_trace = BuiltBlockTrace::new();
@@ -520,9 +523,6 @@ impl<
             .get_proposer_payout_tx_value(self.payout_tx_gas, &self.building_ctx)?)
     }
 
-    // TODO(chirag)
-    fn deduct_reserve_gas(&mut self, gas: u64) {}
-
     fn finalize_block(
         &mut self,
         local_ctx: &mut ThreadBlockBuildingContext,
@@ -564,5 +564,9 @@ impl<
         seen_competition_bid: Option<U256>,
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
         self.finalize_block_impl(local_ctx, payout_tx_value, seen_competition_bid, true)
+    }
+
+    fn deduct_reserved_space(&mut self, space: BlockSpace) {
+        self.partial_block.deduct_reserved_space(space);
     }
 }

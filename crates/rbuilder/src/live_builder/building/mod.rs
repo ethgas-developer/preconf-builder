@@ -1,24 +1,33 @@
 pub mod built_block_cache;
 
-use tracing::error;
 use crate::{
     building::{
         builders::{BlockBuildingAlgorithm, BlockBuildingAlgorithmInput},
         multi_share_bundle_merger::MultiShareBundleMerger,
         simulated_order_command_to_sink, BlockBuildingContext, SimulatedOrderSink,
-    }, live_builder::{
+    },
+    live_builder::{
         building::built_block_cache::BuiltBlockCache,
-        order_input::{preconf_fetcher::PRECONF_RECEIVER_TIMEOUT_PERIOD, replaceable_order_sink::ReplaceableOrderSink},
-        payload_events::MevBoostSlotData, simulation::SlotOrderSimResults,
-    }, preconf::{PreconfReservedInfo, PreconfState}, provider::StateProviderFactory
+        order_input::{
+            preconf_fetcher::PRECONF_RECEIVER_TIMEOUT_PERIOD,
+            replaceable_order_sink::ReplaceableOrderSink,
+        },
+        payload_events::MevBoostSlotData,
+        simulation::SlotOrderSimResults,
+    },
+    preconf::{PreconfReservedInfo, PreconfState},
+    provider::StateProviderFactory,
 };
 use alloy_primitives::Address;
-use rbuilder_primitives::{OrderId, SimulatedOrder};
+use rbuilder_primitives::{BlockSpace, OrderId, SimulatedOrder};
 use reth_chainspec::EthereumHardforks as _;
 use std::{cell::RefCell, rc::Rc, sync::Arc, thread, time::Duration};
-use tokio::{sync::{broadcast, mpsc, watch}, time::timeout};
+use tokio::{
+    sync::{broadcast, mpsc, watch},
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Interval for checking if last block still corresponds to the parent of the given block building context
 const CHECK_LAST_BLOCK_INTERVAL: Duration = Duration::from_millis(100);
@@ -158,9 +167,11 @@ where
         preconf_state_handler: &PreconfState,
     ) {
         let built_block_cache = Arc::new(BuiltBlockCache::new());
-        let builder_sink =
-            self.sink_factory
-                .create_sink(slot_data.clone(), built_block_cache.clone(), cancel.clone());
+        let builder_sink = self.sink_factory.create_sink(
+            slot_data.clone(),
+            built_block_cache.clone(),
+            cancel.clone(),
+        );
         let (broadcast_input, _) = broadcast::channel(10_000);
 
         let block_number = ctx.block();
@@ -172,8 +183,7 @@ where
             if !is_preconf_alive || cancel.is_cancelled() {
                 preconf_reserved_gas = 0;
                 let fallback_fee_recipient = preconf_state_handler.get_fallback_fee_recipient();
-                // TODO(chirag): set correct preconf fee receip[eint]
-                // ctx.set_preconf_fee_recipient(fallback_fee_recipient);
+                ctx.set_preconf_fee_recipient(fallback_fee_recipient);
                 break 'get_preconf_reserved_info;
             }
             match timeout(
@@ -187,14 +197,14 @@ where
                     if reserved_info.slot == slot {
                         // debug!("got preconf reserved info = {:?}", reserved_info);
                         if reserved_info.empty_space < 0 {
-                            preconf_reserved_gas = u64::try_from(ctx.evm_env.block_env.gas_limit).unwrap();
+                            preconf_reserved_gas =
+                                u64::try_from(ctx.evm_env.block_env.gas_limit).unwrap();
                         } else {
                             preconf_reserved_gas = reserved_info.empty_space.clone() as u64;
                         }
                         if reserved_info.fee_recipient.is_some() {
                             let fee_recipient = reserved_info.fee_recipient.unwrap();
-                            // TODO(chirag): set correct fee recipient
-                            // ctx.set_preconf_fee_recipient(fee_recipient);
+                            ctx.set_preconf_fee_recipient(fee_recipient);
                         }
                         break 'get_preconf_reserved_info;
                     }
@@ -206,7 +216,10 @@ where
             }
         }
         if !cancel.is_cancelled() {
-            debug!("start building jobs on slot={} with preconf reserved gas={}", slot, preconf_reserved_gas);
+            debug!(
+                "start building jobs on slot={} with preconf reserved gas={}",
+                slot, preconf_reserved_gas
+            );
             for builder in self.builders.iter() {
                 let builder_name = builder.name();
                 debug!(
@@ -223,7 +236,10 @@ where
                     sink: builder_sink.clone(),
                     cancel: cancel.clone(),
                     built_block_cache: built_block_cache.clone(),
-                    preconf_reserved_gas,
+                    preconf_reserved_gas: BlockSpace {
+                        gas: preconf_reserved_gas,
+                        ..Default::default()
+                    },
                 };
                 let builder = builder.clone();
                 tokio::task::spawn_blocking(move || {

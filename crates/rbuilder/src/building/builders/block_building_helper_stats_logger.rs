@@ -243,7 +243,7 @@ impl BlockBuildingHelper for BlockBuildingHelperStatsLogger<'_> {
         unimplemented!()
     }
 
-    fn deduct_reserve_gas(&mut self, gas: u64) {
-        
+    fn deduct_reserved_space(&mut self, _space: rbuilder_primitives::BlockSpace) {
+        unimplemented!()
     }
 }

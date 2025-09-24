@@ -361,6 +361,26 @@ impl BlockBuildingContext {
     pub fn block(&self) -> u64 {
         self.block_number
     }
+
+    pub fn set_preconf_fee_recipient(&mut self, fee_recipient: Address) {
+        self.preconf_fee_recipient = Some(fee_recipient);
+    }
+
+    pub fn modify_use_suggested_fee_recipient_as_coinbase(&mut self) {
+        if self.preconf_fee_recipient.is_some() {
+            self.evm_env.block_env.beneficiary = self.preconf_fee_recipient.unwrap();
+        } else {
+            self.evm_env.block_env.beneficiary = self.attributes.suggested_fee_recipient;
+        }
+    }
+
+    pub fn coinbase_is_suggested_fee_recipient(&self) -> bool {
+        if self.preconf_fee_recipient.is_some() {
+            self.evm_env.block_env.beneficiary == self.preconf_fee_recipient.unwrap()
+        } else {
+            self.evm_env.block_env.beneficiary == self.attributes.suggested_fee_recipient
+        }
+    }
 }
 
 /// This context should be owned by one thread for the duration of the slot.
@@ -504,8 +524,9 @@ impl BlockBuildingSpaceState {
         self.reserved_block_space
     }
 
-    // TODO(chirag)
-    pub fn add_reserve_gas(&mut self, gas: u64) {}
+    pub fn deduct_reserved_space(&mut self, space: BlockSpace) {
+        self.reserved_block_space -= space;
+    }
 
     /// Used+Reserved
     pub fn total_consumed_space(&self) -> BlockSpace {
@@ -708,18 +729,12 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         self.space_state.reserve_block_space(space);
     }
 
-    // TODO(chirag)
-    pub fn add_reserve_gas(&mut self, space: BlockSpace) {
-        // self.space_state.reserved_block_space.add(space);
-    }
-
-    // TODO(chirag)
-    pub fn deduct_reserve_gas(&mut self, gas: u64) {
-        // self.space_state.reserved_block_space -= gas;
-    }
-
     pub fn free_reserved_block_space(&mut self) {
         self.space_state.free_reserved_block_space();
+    }
+
+    pub fn deduct_reserved_space(&mut self, space: BlockSpace) {
+        self.space_state.deduct_reserved_space(space);
     }
 
     /// result_filter: little hack to allow "cancel" the execution depending no the SimValue result. Ideally it would be nicer to split commit_order

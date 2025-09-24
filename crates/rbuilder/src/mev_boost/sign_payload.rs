@@ -1,8 +1,5 @@
 use crate::utils::u256decimal_serde_helper;
-use alloy_eips::eip7685::Requests;
-use alloy_eips::{eip2718::Encodable2718, eip4844::BlobTransactionSidecar};
-use alloy_primitives::{Address, BlockHash, Bytes, FixedBytes, B256, U256};
-use alloy_rpc_types_beacon::requests::ExecutionRequestsV4;
+use alloy_primitives::{Address, BlockHash, FixedBytes, B256, U256};
 use alloy_rpc_types_beacon::{
     events::PayloadAttributesData, relay::BidTrace, BlsPublicKey, BlsSignature,
 };

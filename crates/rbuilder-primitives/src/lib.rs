@@ -1083,6 +1083,22 @@ impl Order {
         gas_limit
     }
 
+    pub fn get_rlp_length(&self) -> usize {
+        let mut rlp_length = 0;
+        self.list_txs()
+            .iter()
+            .for_each(|(tx, _)| rlp_length += tx.tx.inner().length());
+        rlp_length
+    }
+
+    pub fn get_blob_gas(&self) -> u64 {
+        let mut blob_gas = 0;
+        self.list_txs()
+            .iter()
+            .for_each(|(tx, _)| blob_gas += tx.blobs_gas_used());
+        blob_gas
+    }
+
     /// Vec<(Tx, allowed to revert)>
     pub fn list_txs(&self) -> Vec<(&TransactionSignedEcRecoveredWithBlobs, bool)> {
         match self {

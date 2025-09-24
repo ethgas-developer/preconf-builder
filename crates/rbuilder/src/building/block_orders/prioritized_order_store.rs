@@ -1,13 +1,13 @@
 use std::{collections::hash_map::Entry, sync::Arc};
 
+use crate::telemetry::mark_order_not_ready_for_immediate_inclusion;
 use ahash::{HashMap, HashSet};
 use alloy_primitives::Address;
 use priority_queue::PriorityQueue;
-use tracing::debug;
-use crate::telemetry::mark_order_not_ready_for_immediate_inclusion;
 use rbuilder_primitives::{
-    order_statistics::OrderStatistics, AccountNonce, Nonce, OrderId, SimulatedOrder,
+    order_statistics::OrderStatistics, AccountNonce, BlockSpace, Nonce, OrderId, SimulatedOrder,
 };
+use tracing::debug;
 
 use super::{OrderPriority, SimulatedOrderSink};
 
@@ -164,32 +164,50 @@ impl<OrderPriorityType: OrderPriority> PrioritizedOrderStore<OrderPriorityType> 
         res
     }
 
-     pub fn print_priority_queue(&self, tag: &str) {
+    pub fn print_priority_queue(&self, tag: &str) {
         debug!("[{}] current main queue: {:?}", tag, self.main_queue);
     }
 
-    pub fn get_bottom_preconf_gas(&self) -> u64 {
+    pub fn get_bottom_preconf_space(&self) -> BlockSpace {
         let mut gas = 0;
+        let mut rlp_length = 0usize;
+        let mut blob_gas = 0;
         self.orders.iter().for_each(|(_, sim_order)| {
             if sim_order.is_bottom_preconf() {
                 gas += sim_order.order.get_gas_limit();
+                rlp_length += sim_order.order.get_rlp_length();
+                blob_gas += sim_order.order.get_blob_gas();
             }
         });
-        gas
+        BlockSpace {
+            gas,
+            rlp_length,
+            blob_gas,
+        }
     }
 
-    pub fn get_payout_preconf_gas(&self) -> u64 {
+    pub fn get_payout_preconf_space(&self) -> BlockSpace {
         let mut gas = 0;
+        let mut rlp_length = 0usize;
+        let mut blob_gas = 0;
         self.orders.iter().for_each(|(_, sim_order)| {
             if sim_order.is_payout_preconf() {
                 gas += sim_order.order.get_gas_limit();
+                rlp_length += sim_order.order.get_rlp_length();
+                blob_gas += sim_order.order.get_blob_gas();
             }
         });
-        gas
+        BlockSpace {
+            gas,
+            rlp_length,
+            blob_gas,
+        }
     }
 
     pub fn contains_preconf(&self) -> bool {
-        self.orders.iter().any(|(_, sim_order)| sim_order.is_preconf())
+        self.orders
+            .iter()
+            .any(|(_, sim_order)| sim_order.is_preconf())
     }
 }
 

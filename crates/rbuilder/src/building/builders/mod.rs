@@ -18,7 +18,7 @@ use crate::{
 use ahash::HashSet;
 use alloy_eips::eip7594::BlobTransactionSidecarVariant;
 use alloy_primitives::{Address, Bytes};
-use rbuilder_primitives::{mev_boost::BidAdjustmentData, AccountNonce, OrderId, SimulatedOrder};
+use rbuilder_primitives::{mev_boost::BidAdjustmentData, AccountNonce, BlockSpace, OrderId, SimulatedOrder};
 use reth::primitives::SealedBlock;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use tokio::sync::{
@@ -53,7 +53,7 @@ pub struct LiveBuilderInput<P> {
     pub builder_name: String,
     pub cancel: CancellationToken,
     pub built_block_cache: Arc<BuiltBlockCache>,
-    pub preconf_reserved_gas: u64,
+    pub preconf_reserved_gas: BlockSpace,
 }
 
 /// Struct that helps reading new orders/cancellations
@@ -204,7 +204,7 @@ pub struct BlockBuildingAlgorithmInput<P> {
     /// A cache common to several builders so they can optimize their work looking at other builders blocks.
     pub built_block_cache: Arc<BuiltBlockCache>,
     pub cancel: CancellationToken,
-    pub preconf_reserved_gas: u64,
+    pub preconf_reserved_gas: BlockSpace,
 }
 
 /// Algorithm to build blocks

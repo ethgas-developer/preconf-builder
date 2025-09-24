@@ -24,7 +24,7 @@ use crate::{
     telemetry::mark_builder_considers_order,
     utils::elapsed_ms,
 };
-use rbuilder_primitives::order_statistics::OrderStatistics;
+use rbuilder_primitives::{order_statistics::OrderStatistics, BlockSpace};
 
 /// Assembles block building results from the best orderings of order groups.
 pub struct BlockBuildingResultAssembler {
@@ -185,7 +185,7 @@ impl BlockBuildingResultAssembler {
             self.discard_txs,
             OrderStatistics::default(),
             self.cancellation_token.clone(),
-            0,
+            BlockSpace::ZERO,
         )?;
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
 
@@ -259,7 +259,7 @@ impl BlockBuildingResultAssembler {
             self.discard_txs,
             OrderStatistics::default(),
             CancellationToken::new(),
-            0,
+            BlockSpace::ZERO,
         )?;
 
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);

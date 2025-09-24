@@ -26,7 +26,7 @@ use crate::{
 use ahash::{HashMap, HashSet};
 use alloy_primitives::U256;
 use derivative::Derivative;
-use rbuilder_primitives::{AccountNonce, OrderId, SimValue, SimulatedOrder};
+use rbuilder_primitives::{AccountNonce, BlockSpace, OrderId, SimValue, SimulatedOrder};
 use reth_provider::StateProvider;
 use serde::Deserialize;
 use std::{
@@ -177,7 +177,7 @@ where
         block_orders_from_sim_orders::<OrderPriorityType>(input.sim_orders, &state_provider)?;
     let mut local_ctx = ThreadBlockBuildingContext::default();
     let preconf_reserved_gas =
-        block_orders.get_bottom_preconf_gas() + block_orders.get_payout_preconf_gas();
+        block_orders.get_bottom_preconf_space() + block_orders.get_payout_preconf_space();
     let mut builder = OrderingBuilderContext::new(
         Arc::from(state_provider),
         input.builder_name,
@@ -240,13 +240,13 @@ impl OrderingBuilderContext {
         &mut self,
         block_orders: PrioritizedOrderStore<OrderPriorityType>,
         cancel_block: CancellationToken,
-        preconf_reserved_gas: u64,
+        preconf_reserved_space: BlockSpace,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         self.build_block_with_execution_tracer(
             block_orders,
             cancel_block,
             NullPartialBlockExecutionTracer {},
-            preconf_reserved_gas,
+            preconf_reserved_space,
         )
     }
 
@@ -261,20 +261,21 @@ impl OrderingBuilderContext {
         mut block_orders: PrioritizedOrderStore<OrderPriorityType>,
         cancel_block: CancellationToken,
         partial_block_execution_tracer: PartialBlockExecutionTracerType,
-        preconf_reserved_gas: u64,
+        preconf_reserved_space: BlockSpace,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         let gas_limit = U256::from(self.ctx.evm_env.block_env.gas_limit);
-        let forced_empty_block = U256::from(preconf_reserved_gas).eq(&gas_limit);
+        let forced_empty_block = U256::from(preconf_reserved_space.gas).eq(&gas_limit);
         let contains_preconf = block_orders.contains_preconf();
         let enabled_self_payout = forced_empty_block && !contains_preconf;
+        let enabled_coinbase_payout = !enabled_self_payout;
 
-        // trace!(
-        //     "enabled_coinbase_payout: {:?} -> enabled_self_payout: {:?}(forced_empty_block: {:?}, contains_preconf: {:?})",
-        //     enabled_coinbase_payout,
-        //     enabled_self_payout,
-        //     forced_empty_block,
-        //     contains_preconf,
-        // );
+        trace!(
+            "enabled_coinbase_payout: {:?} -> enabled_self_payout: {:?}(forced_empty_block: {:?}, contains_preconf: {:?})",
+            enabled_coinbase_payout,
+            enabled_self_payout,
+            forced_empty_block,
+            contains_preconf,
+        );
 
         let build_attempt_id: u32 = rand::random();
         let span = info_span!("build_run", build_attempt_id);
@@ -284,16 +285,16 @@ impl OrderingBuilderContext {
 
         self.failed_orders.clear();
         self.order_attempts.clear();
-        let bottom_preconf_gas = block_orders.get_bottom_preconf_gas();
-        let payout_preconf_gas = block_orders.get_payout_preconf_gas();
+        let bottom_preconf_space = block_orders.get_bottom_preconf_space();
+        let payout_preconf_space = block_orders.get_payout_preconf_space();
 
-        let reserved_gas = preconf_reserved_gas + bottom_preconf_gas + payout_preconf_gas;
+        let reserved_gas = preconf_reserved_space + bottom_preconf_space + payout_preconf_space;
         trace!(
             "reserved_gas: {:?} = preconf_reserved_gas: {:?}, bottom_preconf_gas: {:?}, payout_preconf_gas: {:?}",
-            reserved_gas,
-            preconf_reserved_gas,
-            bottom_preconf_gas,
-            payout_preconf_gas
+            reserved_gas.gas,
+            preconf_reserved_space.gas,
+            bottom_preconf_space.gas,
+            payout_preconf_space.gas,
         );
         let mut block_building_helper = BlockBuildingHelperFromProvider::new_with_execution_tracer(
             self.state.clone(),
@@ -312,8 +313,8 @@ impl OrderingBuilderContext {
             |_| true,
             build_start,
             self.config.build_duration_deadline(),
-            bottom_preconf_gas,
-            payout_preconf_gas,
+            bottom_preconf_space,
+            payout_preconf_space,
         )?;
         add_ordering_builder_base_stage_stats(
             self.builder_name.as_str(),
@@ -352,8 +353,8 @@ impl OrderingBuilderContext {
                     self.config
                         .pre_filtered_build_duration_deadline()
                         .map(|d| build_start.elapsed() + d),
-                    bottom_preconf_gas,
-                    payout_preconf_gas,
+                    bottom_preconf_space,
+                    payout_preconf_space,
                 )?;
                 let considered_stats = block_building_helper
                     .built_block_trace()
@@ -387,8 +388,8 @@ impl OrderingBuilderContext {
         order_filter: OrderFilter,
         build_start: Instant,
         deadline: Option<Duration>,
-        bottom_preconf_gas: u64,
-        payout_preconf_gas: u64,
+        bottom_preconf_space: BlockSpace,
+        payout_preconf_space: BlockSpace,
     ) -> eyre::Result<()> {
         let mut bottom_preconf: Option<Arc<SimulatedOrder>> = None;
         let mut payout_preconf: Option<Arc<SimulatedOrder>> = None;
@@ -479,7 +480,7 @@ impl OrderingBuilderContext {
                 block_building_helper,
                 block_orders,
                 bottom_preconf.unwrap(),
-                bottom_preconf_gas,
+                bottom_preconf_space,
             )
             .expect("bottom preconf order should not fail");
         }
@@ -488,7 +489,7 @@ impl OrderingBuilderContext {
                 block_building_helper,
                 block_orders,
                 payout_preconf.unwrap(),
-                payout_preconf_gas,
+                payout_preconf_space,
             )
             .expect("payout preconf order should not fail");
         }
@@ -500,14 +501,14 @@ impl OrderingBuilderContext {
         block_building_helper: &mut dyn BlockBuildingHelper,
         block_orders: &mut PrioritizedOrderStore<OrderPriorityType>,
         preconf_order: Arc<SimulatedOrder>,
-        gas_limit: u64,
+        gas_limit: BlockSpace,
     ) -> Result<(), Box<dyn std::error::Error>> {
         mark_builder_considers_order(
             preconf_order.id(),
             &block_building_helper.built_block_trace().orders_closed_at,
             block_building_helper.builder_name(),
         );
-        block_building_helper.deduct_reserve_gas(gas_limit);
+        block_building_helper.deduct_reserved_space(gas_limit);
         let start_time = Instant::now();
         let commit_result = block_building_helper.commit_order(
             &mut self.local_ctx,
