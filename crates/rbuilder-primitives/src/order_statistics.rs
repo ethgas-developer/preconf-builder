@@ -14,7 +14,7 @@ impl OrderStatistics {
         Self::default()
     }
 
-    pub fn add_order(&mut self, order: &Order) {
+    pub fn add(&mut self, order: &Order) {
         match order {
             Order::Bundle(_) => self.bundle_count += 1,
             Order::Tx(_) => self.tx_count += 1,

@@ -4,7 +4,7 @@ use alloy_primitives::{Address, TxHash, U256};
 use rbuilder_primitives::{
     order_statistics::OrderStatistics, Order, OrderId, OrderReplacementKey, SimulatedOrder,
 };
-use std::{collections::hash_map, hash::Hasher, ops::Add, time::Duration};
+use std::{collections::hash_map, hash::Hasher, time::Duration};
 use time::OffsetDateTime;
 use tracing::trace;
 
@@ -111,7 +111,7 @@ impl BuiltBlockTrace {
     /// Call after a commit_order ok
     pub fn add_included_order(&mut self, execution_result: ExecutionResult) {
         if execution_result.order.is_preconf() {
-            self.preconf_bundle_count = self.preconf_bundle_count.add(1);
+            self.preconf_bundle_count = std::ops::Add::add(self.preconf_bundle_count, 1);
             trace!(
                 "added preconf bundle (id={}) to included orders.",
                 execution_result.order.id()
@@ -122,12 +122,12 @@ impl BuiltBlockTrace {
 
     /// Call before commit_order
     pub fn add_considered_order(&mut self, sim_order: &SimulatedOrder) {
-        self.considered_orders_statistics.add_order(&sim_order.order);
+        self.considered_orders_statistics.add(&sim_order.order);
     }
 
     /// Call after a commit_order Err
     pub fn add_failed_order(&mut self, sim_order: &SimulatedOrder) {
-        self.failed_orders_statistics.add_order(&sim_order.order);
+        self.failed_orders_statistics.add(&sim_order.order);
     }
 
     // txs, bundles, share bundles

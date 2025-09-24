@@ -248,7 +248,7 @@ impl<OrderPriorityType: OrderPriority> SimulatedOrderSink
                 }
             }
         }
-        self.orders_statistics.add_order(&sim_order.order);
+        self.orders_statistics.add(&sim_order.order);
         // We don't check the result to update orders_statistics since we already checked !self.orders.contains_key
         self.orders.insert(sim_order.id(), sim_order);
     }
