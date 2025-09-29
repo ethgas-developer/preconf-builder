@@ -370,6 +370,14 @@ impl BlockBuildingContext {
         self.preconf_fee_recipient = Some(fee_recipient);
     }
 
+    pub fn get_fee_recipient(&self) -> Address {
+        if let Some(recipient) = self.preconf_fee_recipient {
+            recipient
+        } else {
+            self.attributes.suggested_fee_recipient
+        }
+    }
+
     pub fn modify_use_suggested_fee_recipient_as_coinbase(&mut self) {
         self.builder_signer = None;
         if self.preconf_fee_recipient.is_some() {

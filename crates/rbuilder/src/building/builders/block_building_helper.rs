@@ -362,7 +362,7 @@ impl<
         // Since some extra money might arrived directly the suggested_fee_recipient (when suggested_fee_recipient != coinbase)
         // we check the fee_recipient delta and make our bid include that! This is supposed to be what the relay will check.
         let fee_recipient_balance_after = self.block_state.balance(
-            self.building_ctx.attributes.suggested_fee_recipient,
+            self.building_ctx.get_fee_recipient(),
             &self.building_ctx.shared_cached_reads,
             &mut local_ctx.cached_reads,
         )?;
