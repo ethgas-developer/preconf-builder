@@ -21,7 +21,7 @@ async fn main() -> eyre::Result<()> {
         log_json: config.log_json,
         log_color: config.log_color,
     };
-    logger_config.init_tracing()?;
+    let _guard = logger_config.init_tracing()?;
 
     let global_cancel = CancellationToken::new();
     let global_cancel_clone = global_cancel.clone();

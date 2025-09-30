@@ -62,6 +62,7 @@ pub struct BaseConfig {
     pub redacted_telemetry_server_port: u16,
     #[serde(default = "default_ip")]
     pub redacted_telemetry_server_ip: Ipv4Addr,
+    #[serde(default)]
     pub logging_config: LoggingConfig,
     pub log_json: bool,
     log_level: EnvOrValue<String>,

@@ -34,6 +34,7 @@ pub struct Config {
     /// Example: "info"
     pub log_level: String,
     pub log_color: bool,
+    #[serde(default)]
     pub logging_config: LoggingConfig,
 
     /// Where we publish the bids. Example:"tcp://0.0.0.0:5555"
