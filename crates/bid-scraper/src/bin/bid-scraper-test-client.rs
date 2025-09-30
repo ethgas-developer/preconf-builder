@@ -3,7 +3,7 @@ use bid_scraper::{
     bid_scraper_client::{run_nng_subscriber_with_retries, ScrapedBidsObs},
     types::ScrapedRelayBlockBid,
 };
-use rbuilder_config::LoggerConfig;
+use rbuilder_config::{LoggerConfig, LoggingConfig};
 use std::{env, sync::Arc, time::Duration};
 use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
@@ -31,7 +31,7 @@ async fn main() -> eyre::Result<()> {
 
     let logger_config = LoggerConfig {
         env_filter: "info".to_owned(),
-        log_file_path: None,
+        logging_config: LoggingConfig::Console,
         log_json: false,
         log_color: true,
     };

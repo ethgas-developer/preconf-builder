@@ -1,3 +1,4 @@
+use rbuilder_config::LoggingConfig;
 use serde::Deserialize;
 use serde_with::serde_as;
 
@@ -33,6 +34,7 @@ pub struct Config {
     /// Example: "info"
     pub log_level: String,
     pub log_color: bool,
+    pub logging_config: LoggingConfig,
 
     /// Where we publish the bids. Example:"tcp://0.0.0.0:5555"
     pub publisher_url: String,

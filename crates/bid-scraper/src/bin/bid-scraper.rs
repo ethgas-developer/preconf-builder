@@ -17,7 +17,7 @@ async fn main() -> eyre::Result<()> {
 
     let logger_config = LoggerConfig {
         env_filter: config.log_level.clone(),
-        log_file_path: None,
+        logging_config: config.logging_config,
         log_json: config.log_json,
         log_color: config.log_color,
     };

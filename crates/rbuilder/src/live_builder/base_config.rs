@@ -18,7 +18,7 @@ use alloy_provider::RootProvider;
 use eth_sparse_mpt::{ETHSpareMPTVersion, RootHashThreadPool};
 use eyre::Context;
 use jsonrpsee::RpcModule;
-use rbuilder_config::{EnvOrValue, LoggerConfig};
+use rbuilder_config::{EnvOrValue, LoggerConfig, LoggingConfig};
 use reth::chainspec::chain_value_parser;
 use reth_chainspec::ChainSpec;
 use reth_db::DatabaseEnv;
@@ -62,7 +62,7 @@ pub struct BaseConfig {
     pub redacted_telemetry_server_port: u16,
     #[serde(default = "default_ip")]
     pub redacted_telemetry_server_ip: Ipv4Addr,
-    pub log_file_path: Option<String>,
+    pub logging_config: LoggingConfig,
     pub log_json: bool,
     log_level: EnvOrValue<String>,
     pub log_color: bool,
@@ -168,13 +168,9 @@ pub fn default_ip() -> Ipv4Addr {
 impl BaseConfig {
     pub fn setup_tracing_subscriber(&self) -> eyre::Result<()> {
         let log_level = self.log_level.value()?;
-        let log_file_path: Option<PathBuf> = match self.log_file_path {
-            Some(ref path) => Some(PathBuf::from(path)),
-            None => None,
-        };
         let config = LoggerConfig {
             env_filter: log_level,
-            log_file_path,
+            logging_config: self.logging_config.clone(),
             log_json: self.log_json,
             log_color: self.log_color,
         };
@@ -469,7 +465,7 @@ impl Default for BaseConfig {
             redacted_telemetry_server_ip: default_ip(),
             log_json: false,
             log_level: "info".into(),
-            log_file_path: None,
+            logging_config: LoggingConfig::Console,
             log_color: false,
             error_storage_path: None,
             coinbase_secret_key: None,

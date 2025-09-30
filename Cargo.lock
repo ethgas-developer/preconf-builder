@@ -9106,6 +9106,7 @@ dependencies = [
  "serde",
  "serde_with",
  "toml 0.8.23",
+ "tracing-appender",
  "tracing-subscriber 0.3.20",
 ]
 
