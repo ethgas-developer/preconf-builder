@@ -248,12 +248,13 @@ pub enum TransactionErr {
     BlockSpaceLeft,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelayedKickback {
     pub recipient: Address,
     pub payout_value: U256,
     pub payout_tx_fee: U256,
     pub payout_tx_space_needed: BlockSpace,
+    pub should_pay_in_block: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -926,6 +927,18 @@ impl<
             // Calculate the refund value without refund tx cost.
             let refundable_value = get_percent(refundable_profit, refunds_cfg.percent as usize);
 
+            if refunds_cfg.delayed {
+                // The refund value will be delayed to the BuilderNet refund pipeline.
+                insert.delayed_kickback = Some(DelayedKickback {
+                    recipient: refunds_cfg.recipient,
+                    payout_value: refundable_value,
+                    payout_tx_fee: U256::ZERO,
+                    payout_tx_space_needed: BlockSpace::ZERO,
+                    should_pay_in_block: false,
+                });
+                break 'refund;
+            }
+
             if combined_refunds.contains_key(&refunds_cfg.recipient) {
                 // We already determined that refund for this recipient will cost [`BASE_TX_GAS`]
                 // and previously inserted a bundle that is capable of paying this cost.
@@ -935,6 +948,7 @@ impl<
                     payout_value: refundable_value,
                     payout_tx_fee: U256::ZERO,
                     payout_tx_space_needed: BlockSpace::ZERO,
+                    should_pay_in_block: true,
                 });
                 break 'refund;
             }
@@ -959,6 +973,7 @@ impl<
                     payout_value: payout.tx_value,
                     payout_tx_fee: payout.base_fee,
                     payout_tx_space_needed: payout.space_limit,
+                    should_pay_in_block: true,
                 });
                 break 'refund;
             }
