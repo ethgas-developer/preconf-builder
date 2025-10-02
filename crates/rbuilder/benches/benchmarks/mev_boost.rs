@@ -88,6 +88,7 @@ fn bench_mevboost_sign(c: &mut Criterion) {
                 &payload,
                 BlsPublicKey::ZERO,
                 U256::ZERO,
+                payload.payload_attributes.suggested_fee_recipient,
             )
             .unwrap();
         })
@@ -113,6 +114,8 @@ fn bench_mevboost_sign(c: &mut Criterion) {
                 &payload,
                 BlsPublicKey::ZERO,
                 U256::ZERO,
+                payload.payload_attributes.suggested_fee_recipient,
+
             )
             .unwrap();
         })
