@@ -290,7 +290,7 @@ impl OrderingBuilderContext {
         let forced_empty_block = U256::from(preconf_reserved_space.gas).eq(&gas_limit);
         let contains_preconf = block_orders.contains_preconf();
         let enabled_self_payout = forced_empty_block && !contains_preconf;
-        let enabled_coinbase_payout = !enabled_self_payout;
+        let enabled_coinbase_payout = !enabled_self_payout && use_suggested_fee_recipient_as_coinbase;
 
         trace!(
             "enabled_coinbase_payout: {:?} -> enabled_self_payout: {:?}(forced_empty_block: {:?}, contains_preconf: {:?})",
@@ -308,7 +308,8 @@ impl OrderingBuilderContext {
 
         // Create a new ctx to remove builder_signer if necessary
         let mut new_ctx = self.ctx.clone();
-        if use_suggested_fee_recipient_as_coinbase {
+        if enabled_coinbase_payout {
+            trace!("call modify_use_suggested_fee_recipient_as_coinbase");
             new_ctx.modify_use_suggested_fee_recipient_as_coinbase();
         }
         self.failed_orders.clear();
