@@ -400,6 +400,9 @@ impl<
         seen_competition_bid: Option<U256>,
         adjust_finalized_block: bool,
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
+        self.built_block_trace
+        .set_fee_recepient(self.building_ctx.get_fee_recipient());
+
         if payout_tx_value.is_some() && self.building_ctx.coinbase_is_suggested_fee_recipient() {
             return Err(BlockBuildingHelperError::PayoutTxNotAllowed);
         }
