@@ -1301,15 +1301,16 @@ impl<
                     .map(|r| r.payout_value + r.payout_tx_fee)
                     .unwrap_or_default();
 
-                // Builder does sign txs in this code path, so do not allow negative coinbase
-                // profit.
-                let coinbase_profit = match self
-                    .coinbase_profit_when_refunds(coinbase_balance_before, delayed_refund_cost)?
-                {
+                // If preconf, allow negative profit by capping to 1; otherwise error.
+                let profit_check = self
+                    .coinbase_profit_when_refunds(coinbase_balance_before, delayed_refund_cost)?;
+                let coinbase_profit = match profit_check {
                     Ok(profit) => profit,
+                    Err(OrderErr::NegativeProfit(_)) if metadata.preconf_bid_price.is_some() => {
+                        U256::from(1)
+                    }
                     Err(err) => return Ok(Err(err)),
                 };
-
                 Ok(Ok(OrderOk {
                     coinbase_profit,
                     space_used: ok.space_used,
