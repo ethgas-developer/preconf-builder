@@ -256,6 +256,7 @@ async fn run_submit_to_relays_job(
                 &slot_data.payload_attributes_event.data,
                 slot_data.slot_data.pubkey,
                 block.trace.bid_value,
+                block.trace.fee_recepient,
             ) {
                 Ok((message, signature)) => SignedBuiltBlock {
                     message,
@@ -277,6 +278,7 @@ async fn run_submit_to_relays_job(
                     &slot_data.payload_attributes_event.data,
                     slot_data.slot_data.pubkey,
                     block.trace.bid_value,
+                    block.trace.fee_recepient,
                 ) {
                     Ok((message, signature)) => Some((
                         SignedBuiltBlock {

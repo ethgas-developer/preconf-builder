@@ -924,13 +924,14 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
                 nonce += 1;
             }
         }
+        let fee_recipient = ctx.get_fee_recipient();
 
         let tx = create_payout_tx(
             ctx.chain_spec.as_ref(),
             ctx.evm_env.block_env.basefee,
             builder_signer,
             nonce,
-            ctx.attributes.suggested_fee_recipient,
+            fee_recipient,
             gas_limit,
             value,
         )?;

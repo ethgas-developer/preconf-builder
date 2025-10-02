@@ -107,6 +107,7 @@ pub fn sign_block_for_relay(
     attrs: &PayloadAttributesData,
     proposer_pubkey: BlsPublicKey,
     value: U256,
+    fee_recipient: Address,
 ) -> eyre::Result<(BidTrace, BlsSignature)> {
     let message = BidTrace {
         slot: attrs.proposal_slot,
@@ -114,7 +115,7 @@ pub fn sign_block_for_relay(
         block_hash: sealed_block.hash(),
         builder_pubkey: signer.pub_key(),
         proposer_pubkey,
-        proposer_fee_recipient: attrs.payload_attributes.suggested_fee_recipient,
+        proposer_fee_recipient: fee_recipient,
         gas_limit: sealed_block.gas_limit,
         gas_used: sealed_block.gas_used,
         value,

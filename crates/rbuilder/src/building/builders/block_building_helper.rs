@@ -244,7 +244,7 @@ impl<
     ) -> Result<Self, BlockBuildingHelperError> {
         let last_committed_block = building_ctx.block() - 1;
         check_block_hash_reader_health(last_committed_block, &state_provider)?;
-
+        let fee_recipient = building_ctx.get_fee_recipient();
         let fee_recipient_balance_start = state_provider
             .account_balance(&building_ctx.attributes.suggested_fee_recipient)?
             .unwrap_or_default();
@@ -259,7 +259,7 @@ impl<
             None
         } else {
             let payout_tx_space = estimate_payout_gas_limit(
-                building_ctx.attributes.suggested_fee_recipient,
+                fee_recipient,
                 &building_ctx,
                 local_ctx,
                 &mut block_state,
