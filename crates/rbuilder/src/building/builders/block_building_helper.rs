@@ -137,7 +137,7 @@ pub struct BlockBuildingHelperFromProvider<
     PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
 > {
     /// Balance of fee recipient before we stared building.
-    _fee_recipient_balance_start: U256,
+    fee_recipient_balance_start: U256,
     /// Accumulated changes for the block (due to commit_order calls).
     block_state: BlockState,
     partial_block: PartialBlock<GasUsedSimulationTracer, PartialBlockExecutionTracerType>,
@@ -246,7 +246,7 @@ impl<
         check_block_hash_reader_health(last_committed_block, &state_provider)?;
         let fee_recipient = building_ctx.get_fee_recipient();
         let fee_recipient_balance_start = state_provider
-            .account_balance(&building_ctx.attributes.suggested_fee_recipient)?
+            .account_balance(&fee_recipient)?
             .unwrap_or_default();
         let mut partial_block =
             PartialBlock::new_with_execution_tracer(discard_txs, partial_block_execution_tracer)
@@ -276,7 +276,7 @@ impl<
         built_block_trace.available_orders_statistics = available_orders_statistics;
         partial_block.reserve_block_space(preconf_reserved_space);
         Ok(Self {
-            _fee_recipient_balance_start: fee_recipient_balance_start,
+            fee_recipient_balance_start: fee_recipient_balance_start,
             block_state,
             partial_block,
             payout_tx_gas,
@@ -366,16 +366,11 @@ impl<
             &self.building_ctx.shared_cached_reads,
             &mut local_ctx.cached_reads,
         )?;
-        let mut fee_recipient_balance_diff = fee_recipient_balance_after
-            .checked_sub(self._fee_recipient_balance_start)
-            .unwrap_or_default();
 
-        if self.built_block_trace.preconf_bundle_count > 0
-            && fee_recipient_balance_diff < U256::ZERO
-        {
-            // block may contain fee recipient tx that causes the diff to be negative
-            fee_recipient_balance_diff = U256::ZERO;
-        }
+        // if block contains fee recipient tx that causes the diff to be negative, then fee_recipient_balance_diff would be 0
+        let fee_recipient_balance_diff = fee_recipient_balance_after
+            .checked_sub(self.fee_recipient_balance_start)
+            .unwrap_or_default();
 
         if use_last_tx_payment {
             self.built_block_trace.bid_value = max(bid_value, fee_recipient_balance_diff);
@@ -401,7 +396,7 @@ impl<
         adjust_finalized_block: bool,
     ) -> Result<FinalizeBlockResult, BlockBuildingHelperError> {
         self.built_block_trace
-        .set_fee_recepient(self.building_ctx.get_fee_recipient());
+            .set_fee_recepient(self.building_ctx.get_fee_recipient());
 
         if payout_tx_value.is_some() && self.building_ctx.coinbase_is_suggested_fee_recipient() {
             return Err(BlockBuildingHelperError::PayoutTxNotAllowed);

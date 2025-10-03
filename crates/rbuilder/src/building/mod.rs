@@ -1267,7 +1267,7 @@ impl<Tracer: SimulationTracer, PartialBlockExecutionTracerType: PartialBlockExec
         };
 
         let builder_address = builder_signer.address;
-        let fee_recipient_address = ctx.attributes.suggested_fee_recipient;
+        let fee_recipient_address = ctx.get_fee_recipient();
 
         let proof_targets = HashSet::from_iter(
             [builder_address, fee_recipient_address]
