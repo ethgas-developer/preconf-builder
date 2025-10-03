@@ -181,6 +181,7 @@ fn run_finalize_worker(tasks: flume::Receiver<FinalizeTask>) {
                 break;
             }
         };
+        debug!("seen competition bid {}", seen_competition_bid);
 
         let result = block.finalize_block(&mut local_ctx, payout_tx_val, seen_competition_bid);
         let _ = result_sender.send(result);
