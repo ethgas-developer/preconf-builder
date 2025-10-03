@@ -9110,6 +9110,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber 0.3.20",
  "url",
  "uuid",

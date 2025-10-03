@@ -37,6 +37,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
+use tracing_appender::non_blocking::WorkerGuard;
 use url::Url;
 
 use super::{
@@ -167,7 +168,7 @@ pub fn default_ip() -> Ipv4Addr {
 }
 
 impl BaseConfig {
-    pub fn setup_tracing_subscriber(&self) -> eyre::Result<()> {
+    pub fn setup_tracing_subscriber(&self) -> eyre::Result<Option<WorkerGuard>> {
         let log_level = self.log_level.value()?;
         let config = LoggerConfig {
             env_filter: log_level,
@@ -175,8 +176,7 @@ impl BaseConfig {
             log_json: self.log_json,
             log_color: self.log_color,
         };
-        config.init_tracing()?;
-        Ok(())
+        config.init_tracing()
     }
 
     pub fn redacted_telemetry_server_address(&self) -> SocketAddr {

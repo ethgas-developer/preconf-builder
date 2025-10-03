@@ -111,7 +111,7 @@ where
     };
 
     let config: ConfigType = load_toml_config(cli.config)?;
-    config.base_config().setup_tracing_subscriber()?;
+    let _guard = config.base_config().setup_tracing_subscriber()?;
 
     let ready_to_build = Arc::new(AtomicBool::new(false));
     // Spawn redacted server that is safe for tdx builders to expose
