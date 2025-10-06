@@ -40,14 +40,11 @@ docker-image-test-relay: ## Build a test relay Docker image
 .PHONY: lint
 lint: ## Run the linters
 	cargo fmt -- --check
-	cargo clippy --features "$(FEATURES)" -- -D warnings
-	cargo clippy -p op-rbuilder --features "$(FEATURES)" -- -D warnings
+	cargo clippy --workspace --features "$(FEATURES)" -- -D warnings
 
 .PHONY: test
 test: ## Run the tests for rbuilder
 	cargo test --verbose --features "$(FEATURES)"
-	cargo test -p op-rbuilder --verbose --features "$(FEATURES)"
-	cargo test -p op-rbuilder --verbose --features "$(FEATURES),flashblocks"
 
 .PHONY: lt
 lt: lint test ## Run "lint" and "test"
@@ -57,7 +54,6 @@ fmt: ## Format the code
 	cargo fmt
 	cargo fix --allow-staged
 	cargo clippy --features "$(FEATURES)" --fix --allow-staged
-	cargo clippy -p op-rbuilder --features "$(FEATURES)" --fix --allow-staged
 
 .PHONY: bench
 bench: ## Run benchmarks

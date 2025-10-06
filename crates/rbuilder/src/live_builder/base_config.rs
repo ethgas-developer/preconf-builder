@@ -10,16 +10,15 @@ use crate::{
     roothash::RootHashContext,
     utils::{
         constants::{MINS_PER_HOUR, SECS_PER_MINUTE},
-        http_provider,
-        tracing::{setup_tracing_subscriber, LoggerConfig},
-        ProviderFactoryReopener, Signer,
+        http_provider, ProviderFactoryReopener, Signer,
     },
 };
 use alloy_primitives::{Address, B256};
 use alloy_provider::RootProvider;
 use eth_sparse_mpt::{ETHSpareMPTVersion, RootHashThreadPool};
-use eyre::{eyre, Context};
+use eyre::Context;
 use jsonrpsee::RpcModule;
+use rbuilder_config::{EnvOrValue, LoggerConfig, LoggingConfig};
 use reth::chainspec::chain_value_parser;
 use reth_chainspec::ChainSpec;
 use reth_db::DatabaseEnv;
@@ -28,10 +27,8 @@ use reth_node_ethereum::EthereumNode;
 use reth_primitives::StaticFileSegment;
 use reth_provider::StaticFileProviderFactory;
 use serde::{Deserialize, Deserializer};
-use serde_with::{serde_as, DeserializeAs};
+use serde_with::serde_as;
 use std::{
-    env::var,
-    fs::read_to_string,
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     str::FromStr,
@@ -40,6 +37,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
+use tracing_appender::non_blocking::WorkerGuard;
 use url::Url;
 
 use super::{
@@ -50,9 +48,6 @@ use super::{
     block_output::unfinished_block_processing::UnfinishedBuiltBlocksInputFactory,
     payload_events::MevBoostSlotDataGenerator,
 };
-
-/// Prefix for env variables in config
-const ENV_PREFIX: &str = "env:";
 
 /// Base config to be used by all builders.
 /// It allows us to create a base LiveBuilder with no algorithms or custom bidding.
@@ -68,7 +63,8 @@ pub struct BaseConfig {
     pub redacted_telemetry_server_port: u16,
     #[serde(default = "default_ip")]
     pub redacted_telemetry_server_ip: Ipv4Addr,
-    pub log_file_path: Option<String>,
+    #[serde(default)]
+    pub logging_config: LoggingConfig,
     pub log_json: bool,
     log_level: EnvOrValue<String>,
     pub log_color: bool,
@@ -171,44 +167,16 @@ pub fn default_ip() -> Ipv4Addr {
     Ipv4Addr::new(0, 0, 0, 0)
 }
 
-/// Loads config from toml file, some values can be loaded from env variables with the following syntax
-/// e.g. coinbase_secret_key = "env:COINBASE_SECRET_KEY"
-///
-/// variables that can be configured with env values:
-/// - log_level
-/// - coinbase_secret_key
-/// - relay_secret_key
-/// - optimistic_relay_secret_key
-/// - backtest_fetch_mempool_data_dir
-pub fn load_config_toml_and_env<T: serde::de::DeserializeOwned>(
-    path: impl AsRef<Path>,
-) -> eyre::Result<T> {
-    let data = read_to_string(path.as_ref()).with_context(|| {
-        eyre!(
-            "Config file read error: {:?}",
-            path.as_ref().to_string_lossy()
-        )
-    })?;
-
-    let config: T = toml::from_str(&data).context("Config file parsing")?;
-    Ok(config)
-}
-
 impl BaseConfig {
-    pub fn setup_tracing_subscriber(&self) -> eyre::Result<()> {
+    pub fn setup_tracing_subscriber(&self) -> eyre::Result<Option<WorkerGuard>> {
         let log_level = self.log_level.value()?;
-        let log_file_path: Option<PathBuf> = match self.log_file_path {
-            Some(ref path) => Some(PathBuf::from(path)),
-            None => None,
-        };
         let config = LoggerConfig {
             env_filter: log_level,
-            file: log_file_path,
+            logging_config: self.logging_config.clone(),
             log_json: self.log_json,
             log_color: self.log_color,
         };
-        setup_tracing_subscriber(config)?;
-        Ok(())
+        config.init_tracing()
     }
 
     pub fn redacted_telemetry_server_address(&self) -> SocketAddr {
@@ -480,79 +448,6 @@ impl BaseConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnvOrValue<T>(String, std::marker::PhantomData<T>);
-
-impl<T: FromStr> EnvOrValue<T> {
-    pub fn value(&self) -> eyre::Result<String> {
-        let value = &self.0;
-        if value.starts_with(ENV_PREFIX) {
-            let var_name = value.trim_start_matches(ENV_PREFIX);
-            var(var_name).map_err(|_| eyre::eyre!("Env variable: {} not set", var_name))
-        } else {
-            Ok(value.to_string())
-        }
-    }
-}
-
-impl<T> From<&str> for EnvOrValue<T> {
-    fn from(s: &str) -> Self {
-        Self(s.to_string(), std::marker::PhantomData)
-    }
-}
-
-impl<'de, T: FromStr> Deserialize<'de> for EnvOrValue<T> {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(Self(s, std::marker::PhantomData))
-    }
-}
-
-// Helper function to resolve Vec<EnvOrValue<T>> to Vec<T>
-pub fn resolve_env_or_values<T: FromStr>(values: &[EnvOrValue<T>]) -> eyre::Result<Vec<T>> {
-    values
-        .iter()
-        .try_fold(Vec::new(), |mut acc, v| -> eyre::Result<Vec<T>> {
-            let value = v.value()?;
-            if v.0.starts_with(ENV_PREFIX) {
-                // If it's an environment variable, split by comma
-                let parsed: eyre::Result<Vec<T>> = value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        T::from_str(s).map_err(|_| eyre::eyre!("Failed to parse value: {}", s))
-                    })
-                    .collect();
-                acc.extend(parsed?);
-            } else {
-                // If it's not an environment variable, just return the single value
-                acc.push(
-                    T::from_str(&value)
-                        .map_err(|_| eyre::eyre!("Failed to parse value: {}", value))?,
-                );
-            }
-            Ok(acc)
-        })
-}
-
-impl<'de, T> DeserializeAs<'de, EnvOrValue<T>> for EnvOrValue<T>
-where
-    T: FromStr,
-    String: Deserialize<'de>,
-{
-    fn deserialize_as<D>(deserializer: D) -> Result<EnvOrValue<T>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(EnvOrValue(s, std::marker::PhantomData))
-    }
-}
-
 pub const DEFAULT_CL_NODE_URL: &str = "http://127.0.0.1:3500";
 pub const DEFAULT_EL_NODE_IPC_PATH: &str = "/tmp/reth.ipc";
 pub const DEFAULT_INCOMING_BUNDLES_PORT: u16 = 8645;
@@ -571,7 +466,7 @@ impl Default for BaseConfig {
             redacted_telemetry_server_ip: default_ip(),
             log_json: false,
             log_level: "info".into(),
-            log_file_path: None,
+            logging_config: LoggingConfig::Console,
             log_color: false,
             error_storage_path: None,
             coinbase_secret_key: None,

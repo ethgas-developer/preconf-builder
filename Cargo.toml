@@ -11,6 +11,7 @@ exclude = [".github/"]
 members = [
     "crates/rbuilder",
     "crates/rbuilder-primitives",
+    "crates/rbuilder-config",
     "crates/reth-rbuilder",
     "crates/rbuilder/src/test_utils",
     "crates/rbuilder/src/telemetry/metrics_macros",
@@ -131,6 +132,11 @@ alloy-genesis = { version = "1.0.27" }
 alloy-dyn-abi = { version = "1.0.0", features = ["eip712"] }
 alloy-signer = { version = "1.0.27", default-features = false, features = ["eip712"] }
 
+# Version required by ethereum-consensus beacon-api-client
+mev-share-sse = { git = "https://github.com/paradigmxyz/mev-share-rs", rev = "9eb2b0138ab3202b9eb3af4b19c7b3bf40b0faa8", default-features = false }
+beacon-api-client = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "5031d31e318dd861cf3373702c5d92f085d926e4" }
+ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "5031d31e318dd861cf3373702c5d92f085d926e4" }
+
 async-trait = { version = "0.1.83" }
 clap = { version = "4.4.3", features = ["derive", "env"] }
 clap_builder = { version = "4.5.19" }
@@ -139,7 +145,8 @@ eyre = { version = "0.6.12" }
 jsonrpsee = { version = "0.24.4" }
 jsonrpsee-types = { version = "0.24.4" }
 parking_lot = { version = "0.12.3" }
-tokio = { version = "1.40.0" }
+tokio = { version = "1.40.0", default-features = false }
+futures = "0.3"
 auto_impl = { version = "1.2.0" }
 reqwest = { version = "0.12.8" }
 serde = { version = "1.0.210" }
@@ -154,11 +161,14 @@ warp = "0.3.7"
 flate2 = "1.0.35"
 prometheus = "0.13.4"
 ctor = "0.2"
+rand = "0.8"
+toml = "0.8.8"
 
 libc = { version = "0.2.161" }
 lazy_static = "1.4.0"
 tikv-jemallocator = { version = "0.6" }
 tracing = "0.1.37"
+tracing-appender = "0.2.2"
 metrics = { version = "0.24.1" }
 ahash = "0.8.6"
 time = { version = "0.3.36", features = ["macros", "formatting", "parsing"] }
@@ -167,5 +177,6 @@ eth-sparse-mpt = { path = "crates/eth-sparse-mpt" }
 bid-scraper = { path = "crates/bid-scraper" }
 rbuilder = { path = "crates/rbuilder" }
 rbuilder-primitives = { path = "crates/rbuilder-primitives" }
+rbuilder-config = { path = "crates/rbuilder-config" }
 sysperf = { path = "crates/sysperf" }
 metrics_macros = { path = "crates/rbuilder/src/telemetry/metrics_macros" }

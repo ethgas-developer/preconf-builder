@@ -4,8 +4,8 @@ use metrics::spawn_metrics_server;
 use rbuilder::{
     beacon_api_client::Client,
     mev_boost::{MevBoostRelaySlotInfoProvider, RelayClient},
-    utils::tracing::{setup_tracing_subscriber, LoggerConfig},
 };
+use rbuilder_config::{LoggerConfig, LoggingConfig};
 use relay::spawn_relay_server;
 use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
@@ -81,13 +81,13 @@ async fn main() -> eyre::Result<()> {
 
     let global_cancellation = CancellationToken::new();
 
-    let config = LoggerConfig {
+    let logger_config = LoggerConfig {
         env_filter: cli.rust_log,
-        file: None,
+        logging_config: LoggingConfig::Console,
         log_json: cli.log_json,
         log_color: false,
     };
-    setup_tracing_subscriber(config)?;
+    logger_config.init_tracing()?;
 
     spawn_metrics_server(cli.metrics_address);
 

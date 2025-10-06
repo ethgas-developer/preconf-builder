@@ -22,6 +22,8 @@ alloy-rpc-types-eth.workspace = true
 revm.workspace = true
 revm-inspectors.workspace = true
 
+ethereum-consensus.workspace = true
+
 # misc
 derivative = "2.2.0"
 integer-encoding = "4.0.0"
@@ -31,7 +33,7 @@ governor = "0.6.3"
 ahash.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde_with = { workspace = true, features = ["time_0_3"] }
-toml = { version = "0.8.8", default-features = false }
+toml.workspace = true
 tracing.workspace = true
 time.workspace = true
 thiserror.workspace = true
@@ -49,3 +51,6 @@ reth-primitives.workspace = true
 reth-ethereum-primitives.workspace = true
 reth-node-core.workspace = true
 reth.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

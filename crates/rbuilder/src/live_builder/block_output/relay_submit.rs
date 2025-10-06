@@ -215,6 +215,10 @@ async fn run_submit_to_relays_job(
             order_ids: executed_orders.map(|o| o.id()).collect(),
         };
 
+        if block.trace.seen_competition_bid.is_none() {
+            info!("seen_competition_bid is none");
+        }
+
         let submission_span = info_span!(
             "bid",
             bid_value = format_ether(block.trace.bid_value),

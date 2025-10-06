@@ -136,6 +136,8 @@ pub struct BundleRefund {
     /// Transaction hash to refund.
     /// This means that part (percent%) of the profit from the execution this txs goes to refund.recipient
     pub tx_hash: TxHash,
+    /// Boolean for whether the refund should be delayed.
+    pub delayed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

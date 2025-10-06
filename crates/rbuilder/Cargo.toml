@@ -12,6 +12,7 @@ build = "build.rs"
 
 [dependencies]
 rbuilder-primitives.workspace = true
+rbuilder-config.workspace = true
 
 serde = { workspace = true }
 derive_more = { workspace = true }
@@ -78,8 +79,9 @@ sqlx = { version = "0.7.1", features = [
     "uuid",
 ] }
 tracing.workspace = true
+tracing-appender.workspace = true
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "json"] }
-futures = "0.3.28"
+futures.workspace = true
 time.workspace = true
 bigdecimal = "0.4.1"
 mempool-dumpster = "0.1.1"
@@ -94,18 +96,18 @@ secp256k1 = { workspace = true, features = [
 rayon = "1.8.0"
 flate2.workspace = true
 # Version required by ethereum-consensus beacon-api-client
-mev-share-sse = { git = "https://github.com/paradigmxyz/mev-share-rs", rev = "9eb2b0138ab3202b9eb3af4b19c7b3bf40b0faa8", default-features = false }
+mev-share-sse.workspace = true
+beacon-api-client.workspace = true
+ethereum-consensus.workspace = true
 jsonrpsee = { version = "0.20.3", features = ["full"] }
-beacon-api-client = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "5031d31e318dd861cf3373702c5d92f085d926e4" }
-ethereum-consensus = { git = "https://github.com/ralexstokes/ethereum-consensus/", rev = "5031d31e318dd861cf3373702c5d92f085d926e4" }
 uuid = { version = "1.6.1", features = ["serde", "v5", "v4"] }
 prometheus.workspace = true
 warp.workspace = true
 lazy_static.workspace = true
 ctor.workspace = true
-toml = { version = "0.8.8", default-features = false }
+toml.workspace = true
 ahash.workspace = true
-rand = "0.8.5"
+rand.workspace = true
 lru = "0.12.1"
 flume = "0.11.0"
 crossbeam-queue = "0.3.10"
