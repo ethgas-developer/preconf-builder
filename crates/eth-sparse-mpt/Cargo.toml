@@ -16,6 +16,10 @@ serde_with = "3.9.0"
 rustc-hash = "2.0.0"
 rayon = "1.10.0"
 smallvec = "1.13.2"
+alloy-trie.workspace = true
+nybbles = { version = "0.3.3", features = ["serde"] }
+
+tracing.workspace = true
 
 # reth
 reth-errors.workspace = true
@@ -30,23 +34,24 @@ revm.workspace = true
 # alloy
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
-alloy-trie.workspace = true
 
 # other
 parking_lot.workspace = true
+eyre = { workspace = true }
+arrayvec = "0.7.6"
+dashmap = { version = "6.1.0", features = ["rayon"] }
 
 # test deps
 hash-db = { version = "0.15.2", optional = true }
 triehash = { version = "0.8.4", optional = true }
 flate2 = { workspace = true, optional = true }
-eyre = { workspace = true, optional = true}
 
 [features]
-benchmark-utils = ["dep:hash-db", "dep:triehash", "dep:flate2", "dep:eyre"]
+benchmark-utils = ["dep:hash-db", "dep:triehash", "dep:flate2"]
 
 [dev-dependencies]
 criterion = { version = "0.4", features = ["html_reports"] }
-rand = { version = "0.8.5", features = ["small_rng"] }
+rand = { workspace = true, features = ["small_rng"] }
 proptest = "1.5.0"
 eth-sparse-mpt = { path = ".", features = ["benchmark-utils"] }
 
@@ -60,5 +65,9 @@ harness = false
 
 [[bench]]
 name = "trie_example_bench"
+harness = false
+
+[[bench]]
+name = "trie_do_bench"
 harness = false
 

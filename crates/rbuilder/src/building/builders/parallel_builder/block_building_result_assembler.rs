@@ -16,12 +16,15 @@ use crate::{
             block_building_helper::{
                 BiddableUnfinishedBlock, BlockBuildingHelper, BlockBuildingHelperFromProvider,
             },
-            handle_building_error, UnfinishedBlockBuildingSink,
+            handle_building_error,
         },
         BlockBuildingContext, ThreadBlockBuildingContext,
     },
+    live_builder::block_output::unfinished_block_processing::UnfinishedBuiltBlocksInput,
     telemetry::mark_builder_considers_order,
+    utils::elapsed_ms,
 };
+use rbuilder_primitives::{order_statistics::OrderStatistics, BlockSpace};
 
 /// Assembles block building results from the best orderings of order groups.
 pub struct BlockBuildingResultAssembler {
@@ -33,7 +36,7 @@ pub struct BlockBuildingResultAssembler {
     coinbase_payment: bool,
     can_use_suggested_fee_recipient_as_coinbase: bool,
     builder_name: String,
-    sink: Option<Arc<dyn UnfinishedBlockBuildingSink>>,
+    sink: Option<UnfinishedBuiltBlocksInput>,
     best_results: Arc<BestResults>,
     run_id: u64,
     last_version: Option<u64>,
@@ -57,7 +60,7 @@ impl BlockBuildingResultAssembler {
         cancellation_token: CancellationToken,
         builder_name: String,
         can_use_suggested_fee_recipient_as_coinbase: bool,
-        sink: Option<Arc<dyn UnfinishedBlockBuildingSink>>,
+        sink: Option<UnfinishedBuiltBlocksInput>,
     ) -> Self {
         Self {
             state,
@@ -139,7 +142,7 @@ impl BlockBuildingResultAssembler {
                     trace!(
                         run_id = self.run_id,
                         version = version,
-                        time_ms = time_start.elapsed().as_millis(),
+                        time_ms = elapsed_ms(time_start),
                         profit = format_ether(value),
                         "Parallel builder built new block",
                     );
@@ -199,9 +202,9 @@ impl BlockBuildingResultAssembler {
             &mut self.local_ctx,
             self.builder_name.clone(),
             self.discard_txs,
-            0,
-            false,
+            OrderStatistics::default(),
             self.cancellation_token.clone(),
+            BlockSpace::ZERO,
         )?;
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
 
@@ -241,7 +244,7 @@ impl BlockBuildingResultAssembler {
                 let success = commit_result.is_ok();
                 match commit_result {
                     Ok(res) => {
-                        gas_used = res.gas_used;
+                        gas_used = res.space_used.gas;
                     }
                     Err(err) => execution_error = Some(err),
                 }
@@ -273,9 +276,9 @@ impl BlockBuildingResultAssembler {
             &mut self.local_ctx,
             String::from("backtest_builder"),
             self.discard_txs,
-            0,
-            false,
+            OrderStatistics::default(),
             CancellationToken::new(),
+            BlockSpace::ZERO,
         )?;
 
         block_building_helper.set_trace_orders_closed_at(orders_closed_at);
@@ -312,7 +315,7 @@ impl BlockBuildingResultAssembler {
                         tracing::trace!(
                             order_id = ?sim_order.id(),
                             success = true,
-                            gas_used = res.gas_used,
+                            gas_used = res.space_used.gas,
                             "Executed order in backtest"
                         );
                     }
@@ -350,7 +353,7 @@ impl BlockBuildingResultAssembler {
                 .any(|(order_idx, _)| {
                     !order_group.orders[*order_idx]
                         .sim_value
-                        .paid_kickbacks
+                        .paid_kickbacks()
                         .is_empty()
                 })
         })

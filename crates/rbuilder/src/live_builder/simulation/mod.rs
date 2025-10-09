@@ -4,15 +4,16 @@ mod simulation_job;
 use crate::{
     building::{
         sim::{SimTree, SimulatedResult, SimulationRequest},
+        tx_sim_cache::TxExecutionCache,
         BlockBuildingContext,
     },
     live_builder::order_input::orderpool::OrdersForBlock,
-    primitives::{OrderId, SimulatedOrder},
     provider::StateProviderFactory,
     utils::{gen_uid, NonceCache, Signer},
 };
 use ahash::HashMap;
 use parking_lot::Mutex;
+use rbuilder_primitives::{OrderId, SimulatedOrder};
 use simulation_job::SimulationJob;
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -55,6 +56,7 @@ pub struct OrderSimulationPool<P> {
     running_tasks: Arc<Mutex<Vec<JoinHandle<()>>>>,
     current_contexts: Arc<Mutex<CurrentSimulationContexts>>,
     worker_threads: Vec<std::thread::JoinHandle<()>>,
+    use_random_coinbase: bool,
 }
 
 /// Result of a simulation.
@@ -70,7 +72,12 @@ impl<P> OrderSimulationPool<P>
 where
     P: StateProviderFactory + Clone + 'static,
 {
-    pub fn new(provider: P, num_workers: usize, global_cancellation: CancellationToken) -> Self {
+    pub fn new(
+        provider: P,
+        num_workers: usize,
+        use_random_coinbase: bool,
+        global_cancellation: CancellationToken,
+    ) -> Self {
         let mut result = Self {
             provider,
             running_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -78,13 +85,14 @@ where
                 contexts: HashMap::default(),
             })),
             worker_threads: Vec::new(),
+            use_random_coinbase,
         };
         for i in 0..num_workers {
             let ctx = Arc::clone(&result.current_contexts);
             let provider = result.provider.clone();
             let cancel = global_cancellation.clone();
             let handle = std::thread::Builder::new()
-                .name(format!("sim_thread:{}", i))
+                .name(format!("sim_thread:{i}"))
                 .spawn(move || {
                     sim_worker::run_sim_worker(i, ctx, provider, cancel);
                 })
@@ -107,19 +115,22 @@ where
     ) -> SlotOrderSimResults {
         let (slot_sim_results_sender, slot_sim_results_receiver) = mpsc::channel(10_000);
 
-        let ctx = {
+        let ctx = if self.use_random_coinbase {
             // use random coinbase for simulations to make top of the block simulation bypass harder
             let mut ctx = ctx;
             let signer = Signer::random();
             ctx.evm_env.block_env.beneficiary = signer.address;
             ctx.builder_signer = Some(signer);
+            ctx.tx_execution_cache = TxExecutionCache::new(false).into();
+            ctx
+        } else {
             ctx
         };
 
         let provider = self.provider.clone();
         let current_contexts = Arc::clone(&self.current_contexts);
         let block_context: BlockContextId = gen_uid();
-        let span = info_span!("sim_ctx", block = ctx.evm_env.block_env.number, parent = ?ctx.attributes.parent);
+        let span = info_span!("sim_ctx", block = ctx.block(), parent = ?ctx.attributes.parent);
 
         let handle = tokio::spawn(
             async move {
@@ -188,10 +199,10 @@ mod tests {
     use crate::{
         building::testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
         live_builder::order_input::order_sink::OrderPoolCommand,
-        primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs},
         utils::ProviderFactoryReopener,
     };
     use alloy_primitives::U256;
+    use rbuilder_primitives::{MempoolTx, Order, TransactionSignedEcRecoveredWithBlobs};
 
     #[tokio::test]
     async fn test_simulate_order_to_coinbase() {
@@ -205,7 +216,7 @@ mod tests {
         )
         .unwrap();
 
-        let sim_pool = OrderSimulationPool::new(provider_factory_reopener, 4, cancel.clone());
+        let sim_pool = OrderSimulationPool::new(provider_factory_reopener, 4, true, cancel.clone());
         let (order_sender, order_receiver) = mpsc::unbounded_channel();
         let orders_for_block = OrdersForBlock {
             new_order_sub: order_receiver,
@@ -233,7 +244,7 @@ mod tests {
             match command {
                 SimulatedOrderCommand::Simulation(sim_order) => {
                     assert_eq!(
-                        sim_order.sim_value.coinbase_profit,
+                        sim_order.sim_value.full_profit_info().coinbase_profit(),
                         U256::from(coinbase_profit)
                     );
                 }

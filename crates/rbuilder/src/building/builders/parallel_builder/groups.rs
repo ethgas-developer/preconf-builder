@@ -1,10 +1,7 @@
-use crate::{
-    building::evm_inspector::SlotKey,
-    primitives::{OrderId, SimulatedOrder},
-};
 use ahash::{HashMap, HashSet};
 use alloy_primitives::{Address, B256, U256};
 use itertools::Itertools;
+use rbuilder_primitives::{evm_inspector::SlotKey, OrderId, SimulatedOrder};
 use std::sync::Arc;
 
 /// ResolutionResult describes order of certain groups of orders.
@@ -385,11 +382,9 @@ mod tests {
     use reth::primitives::{Transaction, TransactionSigned};
     use reth_primitives::Recovered;
 
-    use crate::{
-        building::evm_inspector::{SlotKey, UsedStateTrace},
-        primitives::{
-            MempoolTx, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
-        },
+    use rbuilder_primitives::{
+        evm_inspector::{SlotKey, UsedStateTrace},
+        MempoolTx, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
     };
 
     use super::ConflictFinder;
@@ -428,7 +423,7 @@ mod tests {
 
         pub fn create_tx(&mut self) -> Recovered<TransactionSigned> {
             Recovered::new_unchecked(
-                TransactionSigned::new(
+                TransactionSigned::new_unchecked(
                     Transaction::Legacy(TxLegacy::default()),
                     alloy_primitives::Signature::test_signature(),
                     self.create_hash(),

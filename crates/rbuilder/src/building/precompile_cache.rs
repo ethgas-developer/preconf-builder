@@ -43,7 +43,7 @@ impl<P> WrappedPrecompile<P> {
 }
 
 impl<CTX: ContextTr, P: PrecompileProvider<CTX, Output = InterpreterResult>> PrecompileProvider<CTX>
-for WrappedPrecompile<P>
+    for WrappedPrecompile<P>
 {
     type Output = P::Output;
 

@@ -1,6 +1,11 @@
 log_json = false
 log_level = "info,rbuilder=debug"
-#log_file_path = "<project path>/preconf-builder/logs/rbuilder.log"
+
+[logging_config.File]
+dir_path = "logs/rbuilder"
+file_name = "rbuilder"
+rotation = "daily"
+
 redacted_telemetry_server_port = 6061
 redacted_telemetry_server_ip = "0.0.0.0"
 full_telemetry_server_port = 6060

@@ -17,11 +17,13 @@ use crate::{
         execute::{backtest_simulate_block, BlockBacktestValue},
         BacktestResultsStorage, BlockData, HistoricalDataStorage, StoredBacktestResult,
     },
-    live_builder::{base_config::load_config_toml_and_env, cli::LiveBuilderConfig},
+    live_builder::cli::LiveBuilderConfig,
+    utils::timestamp_ms_to_offset_datetime,
 };
 use alloy_primitives::{utils::format_ether, Address, U256};
 use clap::Parser;
 use rayon::prelude::*;
+use rbuilder_config::load_toml_config;
 use std::{
     fs::File,
     io::{self, Write},
@@ -30,7 +32,7 @@ use std::{
 use time::format_description::well_known::Rfc3339;
 use tokio::{signal::ctrl_c, sync::mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, warn};
 
 #[derive(Parser, Debug, Clone)]
 struct Cli {
@@ -73,7 +75,7 @@ where
             "Cannot store and compare backtest results at the same time."
         ));
     }
-    let config: ConfigType = load_config_toml_and_env(cli.config.clone())?;
+    let config: ConfigType = load_toml_config(cli.config.clone())?;
     config.base_config().setup_tracing_subscriber()?;
 
     let builders_names = config.base_config().backtest_builders.clone();
@@ -369,9 +371,9 @@ impl CSVResultWriter {
         let mut line = String::new();
         line.push_str("block_number,winning_bid_value,simulated_orders_count");
         for builder_name in &self.builder_names {
-            line.push_str(&format!(",{}", builder_name));
+            line.push_str(&format!(",{builder_name}"));
         }
-        writeln!(self.file, "{}", line)?;
+        writeln!(self.file, "{line}")?;
         self.file.flush()
     }
 
@@ -392,7 +394,7 @@ impl CSVResultWriter {
                 .unwrap_or_default();
             line.push_str(&format!(",{}", format_ether(builder_res)));
         }
-        writeln!(self.file, "{}", line)?;
+        writeln!(self.file, "{line}")?;
         self.file.flush()
     }
 }
@@ -414,17 +416,35 @@ fn spawn_block_fetcher(
             if cancellation_token.is_cancelled() {
                 return;
             }
-            let mut blocks = match historical_data_storage.read_blocks(blocks).await {
+            let blocks = match historical_data_storage.read_blocks(blocks).await {
                 Ok(res) => res,
                 Err(err) => {
                     warn!(?err, "Failed to read blocks from storage");
                     return;
                 }
             };
-            for block in &mut blocks {
-                block.filter_out_ignored_signers(&ignored_signers);
-                block.filter_late_orders(build_block_lag_ms);
-            }
+            let blocks = blocks
+                .iter()
+                .flat_map(|full_block| {
+                    match full_block.snapshot_including_landed(timestamp_ms_to_offset_datetime(
+                        (full_block.winning_bid_trace.timestamp_ms as i64 - build_block_lag_ms)
+                            as u64,
+                    )) {
+                        Ok(mut block) => {
+                            block.filter_out_ignored_signers(&ignored_signers);
+                            Some(block)
+                        }
+                        Err(err) => {
+                            error!(
+                                err = ?err,
+                                block = full_block.block_number,
+                                "Unable to take built snapshot"
+                            );
+                            None
+                        }
+                    }
+                })
+                .collect();
             match sender.send(blocks).await {
                 Ok(_) => {}
                 Err(err) => {

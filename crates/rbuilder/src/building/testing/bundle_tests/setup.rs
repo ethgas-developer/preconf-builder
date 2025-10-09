@@ -2,20 +2,20 @@
 //!
 //! test setup creates fake state with various and block (configurable with BlockArgs)
 //! test setup is used to build orders and commit them
-use crate::{
-    building::{
-        cached_reads::{LocalCachedReads, SharedCachedReads},
-        testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
-        BlockState, ExecutionError, ExecutionResult, OrderErr, PartialBlock,
-        ThreadBlockBuildingContext,
-    },
-    primitives::{
-        order_builder::OrderBuilder, BundleRefund, BundleReplacementData, OrderId, Refund,
-        RefundConfig, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
-    },
+use crate::building::{
+    cached_reads::{LocalCachedReads, SharedCachedReads},
+    testing::test_chain_state::{BlockArgs, NamedAddr, TestChainState, TxArgs},
+    BlockState, ExecutionError, ExecutionResult, NullPartialBlockExecutionTracer, OrderErr,
+    PartialBlock, ThreadBlockBuildingContext,
 };
 use alloy_primitives::{Address, TxHash};
+use rbuilder_primitives::{
+    order_builder::OrderBuilder, BundleRefund, BundleReplacementData, OrderId, Refund,
+    RefundConfig, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs, TxRevertBehavior,
+};
+use reth_provider::StateProvider;
 use revm::database::states::BundleState;
+use std::sync::Arc;
 
 pub enum NonceValue {
     /// Fixed value
@@ -26,7 +26,7 @@ pub enum NonceValue {
 
 #[derive(Debug)]
 pub struct TestSetup {
-    partial_block: PartialBlock<()>,
+    partial_block: PartialBlock<(), NullPartialBlockExecutionTracer>,
     order_builder: OrderBuilder,
     bundle_state: Option<BundleState>,
     test_chain: TestChainState,
@@ -42,9 +42,20 @@ impl TestSetup {
         })
     }
 
+    /// Return a reference to a partial block.
+    pub fn partial_block(&self) -> &PartialBlock<(), NullPartialBlockExecutionTracer> {
+        &self.partial_block
+    }
+
+    /// Return a mutable reference to the chain state.
+    pub fn chain_state_mut(&mut self) -> &mut TestChainState {
+        &mut self.test_chain
+    }
+
     pub fn named_address(&self, named_addr: NamedAddr) -> eyre::Result<Address> {
         self.test_chain.named_address(named_addr)
     }
+
     // Build order methods
 
     pub fn begin_mempool_tx_order(&mut self) {
@@ -209,10 +220,9 @@ impl TestSetup {
         )
     }
     fn try_commit_order(&mut self) -> eyre::Result<Result<ExecutionResult, ExecutionError>> {
-        let state_provider = self.test_chain.provider_factory().latest()?;
+        let state_provider: Arc<dyn StateProvider> =
+            Arc::from(self.test_chain.provider_factory().latest()?);
         let mut local_ctx = ThreadBlockBuildingContext::default();
-        let mut block_state = BlockState::new(state_provider)
-            .with_bundle_state(self.bundle_state.take().unwrap_or_default());
 
         let sim_order = SimulatedOrder {
             order: self.order_builder.build_order(),
@@ -220,18 +230,38 @@ impl TestSetup {
             used_state_trace: Default::default(),
         };
 
-        let result = self.partial_block.commit_order(
-            &sim_order,
-            self.test_chain.block_building_context(),
-            &mut local_ctx,
-            &mut block_state,
-            &|_| Ok(()),
-        )?;
+        // we commit order twice to test evm caching
+        let initial_partial_block = self.partial_block.clone();
+        let initial_bundle_state = self.bundle_state.take().unwrap_or_default();
 
-        let (bundle_state, _) = block_state.into_parts();
-        self.bundle_state = Some(bundle_state);
+        let mut results = Vec::new();
+        for _ in 0..2 {
+            let mut block_state = BlockState::new_arc(state_provider.clone())
+                .with_bundle_state(initial_bundle_state.clone());
 
-        Ok(result)
+            let mut partial_block = initial_partial_block.clone();
+
+            let result = partial_block.commit_order(
+                &sim_order,
+                self.test_chain.block_building_context(),
+                &mut local_ctx,
+                &mut block_state,
+                &|_| Ok(()),
+            )?;
+            results.push(result);
+            let (bundle_state, _) = block_state.into_parts();
+
+            self.bundle_state = Some(bundle_state);
+            self.partial_block = partial_block
+        }
+
+        let second_result = results.pop().unwrap();
+        let first_result = results.pop().unwrap();
+        if first_result != second_result {
+            eyre::bail!("Second order commit differs from the first (caching error) first: {:#?}, second: {:#?}", first_result, second_result);
+        }
+
+        Ok(first_result)
     }
 
     pub fn commit_order_ok(&mut self) -> ExecutionResult {
@@ -242,14 +272,14 @@ impl TestSetup {
     pub fn commit_order_err_check_text(&mut self, expected_error: &str) {
         let res = self.try_commit_order().expect("Failed to commit order");
         match res {
-            Ok(_) => panic!("expected error, result: {:#?}", res),
+            Ok(_) => panic!("expected error, result: {res:#?}"),
             Err(err) => {
                 if !err
                     .to_string()
                     .to_lowercase()
                     .contains(&expected_error.to_lowercase())
                 {
-                    panic!("unexpected error: {}, expected: {}", err, expected_error);
+                    panic!("unexpected error: {err}, expected: {expected_error}");
                 }
             }
         }
@@ -259,12 +289,12 @@ impl TestSetup {
     pub fn commit_order_err_check<F: FnOnce(OrderErr)>(&mut self, err_check: F) {
         let res = self.try_commit_order().expect("Failed to commit order");
         match res {
-            Ok(_) => panic!("expected error,got ok result: {:#?}", res),
+            Ok(_) => panic!("expected error,got ok result: {res:#?}"),
             Err(err) => {
                 if let ExecutionError::OrderError(order_error) = err {
                     err_check(order_error);
                 } else {
-                    panic!("unexpected non OrderErr error: {}", err);
+                    panic!("unexpected non OrderErr error: {err}");
                 }
             }
         }

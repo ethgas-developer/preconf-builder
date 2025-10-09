@@ -1,4 +1,3 @@
-use super::submission::DenebSubmitBlockRequest;
 use alloy_consensus::{Blob, Bytes48};
 use alloy_primitives::{Address, Bloom, Bytes, B256, U256};
 use alloy_rpc_types_beacon::{
@@ -10,6 +9,7 @@ use alloy_rpc_types_engine::{
     BlobsBundleV1, ExecutionPayloadV1, ExecutionPayloadV2, ExecutionPayloadV3,
 };
 use alloy_rpc_types_eth::Withdrawal;
+use rbuilder_primitives::mev_boost::DenebSubmitBlockRequest;
 use reth::rpc::types::engine::PayloadAttributes;
 /// TestDataGenerator allows you to create unique test objects with unique content, it tries to use different numbers for every field it sets
 #[derive(Default)]
@@ -19,12 +19,15 @@ pub struct TestDataGenerator {
 
 impl TestDataGenerator {
     pub fn create_deneb_submit_block_request(&mut self) -> DenebSubmitBlockRequest {
-        DenebSubmitBlockRequest(SignedBidSubmissionV3 {
-            message: self.create_bid_trace(),
-            execution_payload: self.create_deneb_payload(),
-            blobs_bundle: self.create_txs_blobs_sidecars(),
-            signature: self.create_signature(),
-        })
+        DenebSubmitBlockRequest {
+            submission: SignedBidSubmissionV3 {
+                message: self.create_bid_trace(),
+                execution_payload: self.create_deneb_payload(),
+                blobs_bundle: self.create_txs_blobs_sidecars(),
+                signature: self.create_signature(),
+            },
+            adjustment_data: None,
+        }
     }
 
     pub fn create_txs_blobs_sidecars(&mut self) -> BlobsBundleV1 {

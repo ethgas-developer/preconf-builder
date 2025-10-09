@@ -1,6 +1,6 @@
 use crate::live_builder::order_input::preconf_fetcher::WS_READ_TIMEOUT_PERIOD;
 use crate::preconf::{assign_preconf_ordering, convert_str_to_address, convert_timestamp_ns, eth_to_wei, string_to_uuid, PreconfBundleType, PreconfError, PreconfHealthStatus, PreconfInfo, PreconfReservedInfo, PreconfState};
-use crate::primitives::{Bundle, BundleReplacementData, BundleReplacementKey, BundleVersion, Metadata, Order, TransactionSignedEcRecoveredWithBlobs};
+use rbuilder_primitives::{Bundle, BundleReplacementData, BundleReplacementKey, BundleVersion, Metadata, Order, TransactionSignedEcRecoveredWithBlobs};
 use alloy_primitives::{hex, keccak256, Bytes, B256};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};

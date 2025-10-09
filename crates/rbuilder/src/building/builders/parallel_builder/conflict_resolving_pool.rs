@@ -15,8 +15,7 @@ use super::{
     simulation_cache::SharedSimulationCache, ConflictGroup, ConflictResolutionResultPerGroup,
     ConflictTask, GroupId, ResolutionResult, TaskPriority,
 };
-use crate::building::BlockBuildingContext;
-use crate::provider::StateProviderFactory;
+use crate::{building::BlockBuildingContext, provider::StateProviderFactory, utils::elapsed_ms};
 
 pub type TaskQueue = Arc<SegQueue<ConflictTask>>;
 
@@ -28,15 +27,18 @@ pub struct ConflictResolvingPool<P> {
     provider: P,
     simulation_cache: Arc<SharedSimulationCache>,
     num_threads: usize,
+    safe_sorting_only: bool,
 }
 
 impl<P> ConflictResolvingPool<P>
 where
     P: StateProviderFactory + Clone + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         num_threads: usize,
         task_queue: TaskQueue,
+        safe_sorting_only: bool,
         group_result_sender: std_mpsc::Sender<ConflictResolutionResultPerGroup>,
         cancellation_token: CancellationToken,
         ctx: BlockBuildingContext,
@@ -46,6 +48,7 @@ where
         Self {
             task_queue,
             group_result_sender,
+            safe_sorting_only,
             cancellation_token,
             ctx,
             provider,
@@ -83,18 +86,18 @@ where
                             match group_result_sender.send((task_id, result)) {
                                 Ok(_) => {
                                     trace!(
-                                        task_id = %task_id,
-                                        time_taken_ms = %task_start.elapsed().as_millis(),
-                                        "Conflict resolving: successfully sent group result"
-                                    );
+                                                        task_id = %task_id,
+                                    time_taken_ms = %elapsed_ms(task_start),
+                                                        "Conflict resolving: successfully sent group result"
+                                                    );
                                 }
                                 Err(err) => {
                                     warn!(
-                                        task_id = %task_id,
-                                        error = ?err,
-                                        time_taken_ms = %task_start.elapsed().as_millis(),
-                                        "Conflict resolving: failed to send group result"
-                                    );
+                                                        task_id = %task_id,
+                                                        error = ?err,
+                                    time_taken_ms = %elapsed_ms(task_start),
+                                                        "Conflict resolving: failed to send group result"
+                                                    );
                                     return;
                                 }
                             }
@@ -158,7 +161,7 @@ where
     ) -> Vec<(GroupId, (ResolutionResult, ConflictGroup))> {
         let mut results = Vec::new();
         for new_group in new_groups {
-            let tasks = get_tasks_for_group(&new_group, TaskPriority::High);
+            let tasks = get_tasks_for_group(&new_group, TaskPriority::High, self.safe_sorting_only);
             for task in tasks {
                 let simulation_cache = Arc::clone(&simulation_cache);
                 let result = Self::process_task(

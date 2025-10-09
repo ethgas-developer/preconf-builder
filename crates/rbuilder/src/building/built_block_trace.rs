@@ -1,16 +1,17 @@
 use super::{BundleErr, ExecutionError, ExecutionResult, OrderErr};
-use crate::primitives::{Order, OrderId, OrderReplacementKey};
 use ahash::{AHasher, HashMap, HashSet};
 use alloy_primitives::{Address, TxHash, U256};
+use rbuilder_primitives::{
+    order_statistics::OrderStatistics, Order, OrderId, OrderReplacementKey, SimulatedOrder,
+};
 use std::{collections::hash_map, hash::Hasher, time::Duration};
-use std::ops::Add;
 use time::OffsetDateTime;
-use tracing::{trace};
+use tracing::trace;
 
 /// Structs for recording data about a built block, such as what bundles were included, and where txs came from.
 /// Trace can be used to verify bundle invariants.
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct BuiltBlockTrace {
     pub included_orders: Vec<ExecutionResult>,
     /// How much we bid (pay to the validator)
@@ -27,9 +28,22 @@ pub struct BuiltBlockTrace {
     pub orders_sealed_at: OffsetDateTime,
     pub fill_time: Duration,
     pub finalize_time: Duration,
+    pub finalize_adjust_time: Duration,
     pub root_hash_time: Duration,
     /// Value we saw in the competition when we decided to make this bid.
     pub seen_competition_bid: Option<U256>,
+    /// Orders we had available to build the block (we might have not use all of them because of timeouts)
+    pub available_orders_statistics: OrderStatistics,
+    /// Every call to BlockBuildingHelper::commit_order impacts here.
+    pub considered_orders_statistics: OrderStatistics,
+    /// Anything we call BlockBuildingHelper::commit_order on but didn't include (redundant with considered_orders_statistics-included_orders)
+    pub failed_orders_statistics: OrderStatistics,
+
+    /// Every call to BlockBuildingHelper::commit_order during pre-filtered build step impacts here.
+    pub filtered_build_considered_orders_statistics: OrderStatistics,
+    /// Anything we call BlockBuildingHelper::commit_order on but didn't include (redundant with filtered_build_considered_orders_statistics-included_orders) during pre-filtered build step
+    pub filtered_build_failed_orders_statistics: OrderStatistics,
+
     pub preconf_bundle_count: i32,
     pub fee_recepient: Address,
 }
@@ -44,8 +58,6 @@ impl Default for BuiltBlockTrace {
 pub enum BuiltBlockTraceError {
     #[error("More than one order is included with the same replacement data: {0:?}")]
     DuplicateReplacementData(OrderReplacementKey),
-    #[error("Included order had different number of txs and receipts")]
-    DifferentTxsAndReceipts,
     #[error("Included order had tx from or to blocked address")]
     BlockedAddress,
     #[error(
@@ -66,11 +78,26 @@ impl BuiltBlockTrace {
             orders_sealed_at: OffsetDateTime::now_utc(),
             fill_time: Duration::from_secs(0),
             finalize_time: Duration::from_secs(0),
+            finalize_adjust_time: Duration::from_secs(0),
             root_hash_time: Duration::from_secs(0),
-            seen_competition_bid: None,
             preconf_bundle_count: 0,
             fee_recepient: Address::default(),
+            seen_competition_bid: None,
+            considered_orders_statistics: Default::default(),
+            failed_orders_statistics: Default::default(),
+            available_orders_statistics: Default::default(),
+            filtered_build_considered_orders_statistics: Default::default(),
+            filtered_build_failed_orders_statistics: Default::default(),
         }
+    }
+
+    pub fn set_filtered_build_statistics(
+        &mut self,
+        considered_orders_statistics: OrderStatistics,
+        failed_orders_statistics: OrderStatistics,
+    ) {
+        self.filtered_build_considered_orders_statistics = considered_orders_statistics;
+        self.filtered_build_failed_orders_statistics = failed_orders_statistics;
     }
 
     /// Should be called after block is sealed
@@ -79,7 +106,7 @@ impl BuiltBlockTrace {
     pub fn update_orders_sealed_at(&mut self) {
         self.orders_sealed_at = OffsetDateTime::now_utc();
     }
-    
+
     pub fn set_fee_recepient(&mut self, fee_recepient: Address) {
         self.fee_recepient = fee_recepient;
     }
@@ -87,10 +114,23 @@ impl BuiltBlockTrace {
     /// Call after a commit_order ok
     pub fn add_included_order(&mut self, execution_result: ExecutionResult) {
         if execution_result.order.is_preconf() {
-            self.preconf_bundle_count = self.preconf_bundle_count.add(1);
-            trace!("added preconf bundle (id={}) to included orders.", execution_result.order.id());
+            self.preconf_bundle_count = std::ops::Add::add(self.preconf_bundle_count, 1);
+            trace!(
+                "added preconf bundle (id={}) to included orders.",
+                execution_result.order.id()
+            );
         }
         self.included_orders.push(execution_result);
+    }
+
+    /// Call before commit_order
+    pub fn add_considered_order(&mut self, sim_order: &SimulatedOrder) {
+        self.considered_orders_statistics.add(&sim_order.order);
+    }
+
+    /// Call after a commit_order Err
+    pub fn add_failed_order(&mut self, sim_order: &SimulatedOrder) {
+        self.failed_orders_statistics.add(&sim_order.order);
     }
 
     /// Call after a commit_order error
@@ -115,32 +155,22 @@ impl BuiltBlockTrace {
         &self,
         blocklist: &HashSet<Address>,
     ) -> Result<(), BuiltBlockTraceError> {
-        let mut replacement_data_count: HashSet<_> = HashSet::default();
         let mut bundle_txs_scratchpad = HashMap::default();
         let mut executed_tx_hashes_scratchpad = Vec::new();
 
         for res in &self.included_orders {
-            for order in res.order.original_orders() {
-                if let Some(data) = order.replacement_key() {
-                    if replacement_data_count.contains(&data) {
-                        return Err(BuiltBlockTraceError::DuplicateReplacementData(data));
-                    }
-                    replacement_data_count.insert(data);
-                }
-            }
-
-            if res.txs.len() != res.receipts.len() {
-                return Err(BuiltBlockTraceError::DifferentTxsAndReceipts);
-            }
-
             let executed_tx_hashes = {
                 executed_tx_hashes_scratchpad.clear();
                 &mut executed_tx_hashes_scratchpad
             };
-            for (tx, receipt) in res.txs.iter().zip(res.receipts.iter()) {
-                executed_tx_hashes.push((tx.hash(), receipt.success));
-                if blocklist.contains(&tx.signer())
-                    || tx.to().map(|to| blocklist.contains(&to)).unwrap_or(false)
+            for tx_info in &res.tx_infos {
+                executed_tx_hashes.push((tx_info.tx.hash(), tx_info.receipt.success));
+                if blocklist.contains(&tx_info.tx.signer())
+                    || tx_info
+                        .tx
+                        .to()
+                        .map(|to| blocklist.contains(&to))
+                        .unwrap_or(false)
                 {
                     return Err(BuiltBlockTraceError::BlockedAddress);
                 }
@@ -186,7 +216,7 @@ impl BuiltBlockTrace {
     pub fn transactions_hash(&self) -> u64 {
         let mut hasher = AHasher::default();
         for execution_result in &self.included_orders {
-            for tx in &execution_result.txs {
+            for tx in execution_result.tx_infos.iter().map(|info| &info.tx) {
                 let tx_hash = tx.hash();
                 hasher.write(tx_hash.as_slice());
             }

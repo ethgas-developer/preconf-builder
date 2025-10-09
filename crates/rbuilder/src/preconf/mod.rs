@@ -4,7 +4,7 @@ pub mod preconf_ws_client;
 use crate::live_builder::config::{Config};
 use crate::preconf::preconf_api_client::PreconfApiClient;
 use crate::preconf::preconf_ws_client::PreconfWsClient;
-use crate::primitives::Order;
+use rbuilder_primitives::Order;
 use crate::utils::failed_txs_writer::init_reporting_from_preconf_client;
 use alloy_primitives::{Address, U256};
 use futures_util::StreamExt;
