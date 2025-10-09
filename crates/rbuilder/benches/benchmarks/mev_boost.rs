@@ -1,15 +1,13 @@
 use alloy_consensus::{Block, Header};
-use alloy_eips::eip4844::BlobTransactionSidecar;
+use alloy_eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant};
 use alloy_primitives::U256;
+use alloy_rpc_types_beacon::BlsPublicKey;
 use criterion::{criterion_group, Criterion};
-use primitive_types::H384;
-use rbuilder::mev_boost::{
-    rpc::TestDataGenerator, sign_block_for_relay, submission::DenebSubmitBlockRequest,
-    BLSBlockSigner,
-};
+use rbuilder::mev_boost::{rpc::TestDataGenerator, sign_block_for_relay, BLSBlockSigner};
+use rbuilder_primitives::mev_boost::DenebSubmitBlockRequest;
 use reth::primitives::SealedBlock;
-use reth_chainspec::SEPOLIA;
 use reth_primitives::kzg::Blob;
+use ssz::Encode;
 use std::{fs, path::PathBuf, sync::Arc};
 
 fn mev_boost_serialize_submit_block(data: DenebSubmitBlockRequest) {
@@ -72,10 +70,11 @@ fn bench_mevboost_sign(c: &mut Criterion) {
     let signer = BLSBlockSigner::test_signer();
     let mut blobs = vec![];
     for _ in 0..3 {
-        blobs.push(Arc::new(blob.clone()));
+        blobs.push(Arc::new(BlobTransactionSidecarVariant::Eip4844(
+            blob.clone(),
+        )));
     }
 
-    let chain_spec = SEPOLIA.clone();
     let payload = generator.create_payload_attribute_data();
 
     let mut group = c.benchmark_group("MEV-Boost Sign block for relay");
@@ -86,12 +85,9 @@ fn bench_mevboost_sign(c: &mut Criterion) {
             let _ = sign_block_for_relay(
                 &signer,
                 &sealed_block,
-                &blobs,
-                &Vec::new(),
-                &chain_spec,
                 &payload,
-                H384::default(),
-                U256::default(),
+                BlsPublicKey::ZERO,
+                U256::ZERO,
                 payload.payload_attributes.suggested_fee_recipient,
             )
             .unwrap();
@@ -115,13 +111,11 @@ fn bench_mevboost_sign(c: &mut Criterion) {
             let _ = sign_block_for_relay(
                 &signer,
                 &sealed_block_deneb,
-                &blobs,
-                &Vec::new(),
-                &chain_spec,
                 &payload,
-                H384::default(),
-                U256::default(),
+                BlsPublicKey::ZERO,
+                U256::ZERO,
                 payload.payload_attributes.suggested_fee_recipient,
+
             )
             .unwrap();
         })

@@ -11,7 +11,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use tokio::sync::RwLock;
 use url::Url;
 use std::sync::Arc;
-use tracing::{debug, error, trace};
+use tracing::trace;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FailedTx {

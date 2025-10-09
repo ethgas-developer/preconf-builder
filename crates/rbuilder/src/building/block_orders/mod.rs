@@ -10,11 +10,9 @@ mod test_context;
 mod test_data_generator;
 use std::sync::Arc;
 
-use crate::{
-    live_builder::simulation::SimulatedOrderCommand,
-    primitives::{AccountNonce, OrderId, SimulatedOrder},
-};
+use crate::live_builder::simulation::SimulatedOrderCommand;
 use ahash::HashMap;
+use rbuilder_primitives::{AccountNonce, OrderId, SimulatedOrder};
 use reth_errors::ProviderResult;
 use reth_provider::StateProviderBox;
 
@@ -129,14 +127,17 @@ pub fn block_orders_from_sim_orders<OrderPriorityType: OrderPriority>(
 
 #[cfg(test)]
 mod test {
-    use crate::primitives::BundledTxInfo;
+    use rbuilder_primitives::BundledTxInfo;
 
-    use super::{order_priority::OrderMaxProfitPriority, *};
+    use super::{
+        order_priority::{FullProfitInfoGetter, OrderMaxProfitPriority},
+        *,
+    };
     /// Helper struct for common PrioritizedOrderStore test operations
     /// Works hardcoded on Sorting::MaxProfit since it changes nothing on internal logic
     struct TestContext {
         pub data_gen: TestDataGenerator,
-        pub order_pool: PrioritizedOrderStore<OrderMaxProfitPriority>,
+        pub order_pool: PrioritizedOrderStore<OrderMaxProfitPriority<FullProfitInfoGetter>>,
     }
 
     impl TestContext {
@@ -148,7 +149,10 @@ mod test {
                 nonce.clone(),
                 TestContext {
                     data_gen,
-                    order_pool: PrioritizedOrderStore::<OrderMaxProfitPriority>::new(vec![nonce]),
+                    order_pool:
+                        PrioritizedOrderStore::<OrderMaxProfitPriority<FullProfitInfoGetter>>::new(
+                            vec![nonce],
+                        ),
                 },
             )
         }
@@ -166,9 +170,10 @@ mod test {
                 nonce_2.clone(),
                 TestContext {
                     data_gen,
-                    order_pool: PrioritizedOrderStore::<OrderMaxProfitPriority>::new(vec![
-                        nonce_1, nonce_2,
-                    ]),
+                    order_pool:
+                        PrioritizedOrderStore::<OrderMaxProfitPriority<FullProfitInfoGetter>>::new(
+                            vec![nonce_1, nonce_2],
+                        ),
                 },
             )
         }

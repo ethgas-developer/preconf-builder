@@ -3,7 +3,7 @@ use crate::preconf::{
     string_to_uuid, PreconfBundleType, PreconfError, PreconfHealthStatus, PreconfInfo,
     PreconfReservedInfo, PreconfState,
 };
-use crate::primitives::{
+use rbuilder_primitives::{
     Bundle, BundleReplacementData, BundleReplacementKey, BundleVersion, Metadata, Order,
     TransactionSignedEcRecoveredWithBlobs,
 };

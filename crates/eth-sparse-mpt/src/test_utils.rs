@@ -1,11 +1,10 @@
-use std::{fs::File, io::Read, path::Path};
-
 use alloy_primitives::{keccak256, Bytes, B256};
 use flate2::read::GzDecoder;
 use rustc_hash::FxHasher;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::{fs::File, io::Read, path::Path};
 
-use crate::{
+use crate::v1::{
     reth_sparse_trie::{change_set::ETHTrieChangeSet, trie_fetcher::MultiProof},
     sparse_mpt::DiffTrie,
 };
@@ -32,6 +31,10 @@ impl hash_db::Hasher for KeccakHasher {
 }
 
 pub fn reference_trie_hash(data: &[(Bytes, Bytes)]) -> B256 {
+    triehash::trie_root::<KeccakHasher, _, _, _>(data.to_vec())
+}
+
+pub fn reference_trie_hash_vec(data: &[(Vec<u8>, Vec<u8>)]) -> B256 {
     triehash::trie_root::<KeccakHasher, _, _, _>(data.to_vec())
 }
 

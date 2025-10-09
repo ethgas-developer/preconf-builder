@@ -1,13 +1,15 @@
 //! a2r prefix = alloy to reth conversion
 
-use crate::primitives::{
-    serialize::{RawTx, TxEncoding},
-    TransactionSignedEcRecoveredWithBlobs,
-};
+use std::time::{Duration, Instant};
+
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Encodable2718;
 use alloy_primitives::{Address, Sign, I256, U256};
 use alloy_provider::RootProvider;
+use rbuilder_primitives::{
+    serialize::{RawTx, TxEncoding},
+    TransactionSignedEcRecoveredWithBlobs,
+};
 use reth_chainspec::ChainSpec;
 use reth_evm_ethereum::revm_spec_by_timestamp_and_block_number;
 use revm::context::CfgEnv;
@@ -31,16 +33,15 @@ pub use provider_factory_reopen::{
 
 pub mod reconnect;
 
-mod test_data_generator;
-pub use test_data_generator::TestDataGenerator;
-
 mod tx_signer;
 pub use tx_signer::Signer;
 
 pub mod provider_head_state;
-pub mod tracing;
+
 pub mod failed_txs_writer;
 pub use failed_txs_writer::init_reporting_from_preconf_client;
+
+pub mod receipts;
 
 #[cfg(test)]
 pub mod test_utils;
@@ -218,6 +219,21 @@ pub fn format_offset_datetime_rfc3339(datetime: &OffsetDateTime) -> String {
     datetime
         .format(&Rfc3339)
         .expect("failed to format datetime")
+}
+
+#[inline]
+pub fn elapsed_ms(start: Instant) -> f64 {
+    duration_ms(start.elapsed())
+}
+
+#[inline]
+pub fn elapsed_s(start: Instant) -> f64 {
+    duration_ms(start.elapsed()) / 1000.0
+}
+
+#[inline]
+pub fn duration_ms(duration: Duration) -> f64 {
+    duration.as_micros() as f64 / 1000.0
 }
 
 #[cfg(test)]

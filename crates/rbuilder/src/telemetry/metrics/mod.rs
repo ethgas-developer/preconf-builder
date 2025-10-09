@@ -9,29 +9,31 @@
 use crate::{
     building::BuiltBlockTrace,
     live_builder::block_list_provider::{blocklist_hash, BlockList},
-    primitives::mev_boost::MevBoostRelayID,
-    utils::build_info::Version,
+    utils::{build_info::Version, duration_ms},
 };
+use alloy_consensus::constants::GWEI_TO_WEI;
 use alloy_primitives::{utils::Unit, U256};
+use bid_scraper::types::ScrapedRelayBlockBid;
 use bigdecimal::num_traits::Pow;
 use ctor::ctor;
 use lazy_static::lazy_static;
 use metrics_macros::register_metrics;
+use parking_lot::Mutex;
 use prometheus::{
-    Counter, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry,
+    Counter, Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+    Opts, Registry,
 };
+use rbuilder_primitives::mev_boost::MevBoostRelayID;
 use std::{
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use time::OffsetDateTime;
 use tracing::error;
 
+pub mod scope_meter;
 mod tracing_metrics;
-
 pub use tracing_metrics::*;
-
 const SUBSIDY_ATTEMPT: &str = "attempt";
 const SUBSIDY_LANDED: &str = "landed";
 
@@ -41,6 +43,14 @@ const RELAY_ERROR_OTHER: &str = "other";
 
 const SIM_STATUS_OK: &str = "sim_success";
 const SIM_STATUS_FAIL: &str = "sim_fail";
+
+const ROOT_HASH_PREFETCH_STEP: &str = "prefetcher";
+const ROOT_HASH_FINALIZE_STEP: &str = "finalize";
+
+const ORDER_EXECUTED: &str = "executed";
+const ORDER_INCLUDED: &str = "included";
+const BUILDING_STEP_BASE: &str = "base";
+const BUILDING_STEP_PRE_FILTERED: &str = "pre-filtered";
 
 /// We record timestamps only for blocks built within interval of the block timestamp
 const BLOCK_METRICS_TIMESTAMP_LOWER_DELTA: time::Duration = time::Duration::seconds(3);
@@ -99,11 +109,31 @@ register_metrics! {
     .unwrap();
 
 
+    pub static ROOT_HASH_FETCHES: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "rbuilder_sparse_mpt_root_hash_fetches",
+            "Number of nodes fetched in a finalize or prefetch step"
+        ),
+        &["step"],
+    )
+    .unwrap();
+
+    pub static BIDS_RECEIVED: IntCounterVec = IntCounterVec::new(
+        Opts::new(
+            "bids_received",
+            "Number of bids received from bid-scraper"
+        ),
+        &["relay_name", "publisher_name", "publisher_type"]
+    )
+    .unwrap();
 
     pub static CURRENT_BLOCK: IntGauge =
         IntGauge::new("current_block", "Current Block").unwrap();
     pub static ORDERPOOL_TXS: IntGauge =
         IntGauge::new("orderpool_txs", "Transactions In The Orderpool").unwrap();
+
+    pub static ORDERPOOL_TXS_SIZE: IntGauge =
+        IntGauge::new("orderpool_txs_size", "Aprox in memory size of transactions in the Orderpool (bytes)").unwrap();
     pub static ORDERPOOL_BUNDLES: IntGauge =
         IntGauge::new("orderpool_bundles", "Bundles In The Orderpool").unwrap();
 
@@ -112,6 +142,11 @@ register_metrics! {
         &["kind"]
     )
     .unwrap();
+
+    pub static ORDER_INPUT_RPC_ERROR: IntCounterVec = IntCounterVec::new(
+    Opts::new("rbuilder_order_input_rpc_errors", "counter of errors when receiving orders on RPC"),
+    &["kind"],
+    ).unwrap();
 
     pub static RELAY_ERRORS: IntCounterVec = IntCounterVec::new(
         Opts::new("relay_errors", "counter of relay errors"),
@@ -136,12 +171,21 @@ register_metrics! {
         &["optimistic"],
     )
     .unwrap();
+
     pub static RELAY_SUBMIT_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("relay_submit_time", "Time to send bid to the relay (ms)")
             .buckets(linear_buckets_range(0.0, 3000.0, 50)),
         &["relay"],
     )
     .unwrap();
+
+    pub static RPC_PROCESSING_TIME: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("rpc_processing_time", "Time spend in RPC handlers (us)")
+            .buckets(exponential_buckets_range(10.0, 50000.0, 100)),
+        &["api","size"],
+    )
+    .unwrap();
+
     pub static VERSION: IntGaugeVec = IntGaugeVec::new(
         Opts::new("version", "Version of the builder"),
         &["git", "git_ref", "build_time_utc"]
@@ -205,6 +249,8 @@ register_metrics! {
      // SUBSIDY
      /////////////////////////////////
 
+    pub static BUILDER_BALANCE: Gauge = Gauge::new("rbuilder_coinbase_balance", "balance of builder coinbase").unwrap();
+
     /// We decide this at the end of the submission to relays
     pub static SUBSIDIZED_BLOCK_COUNT: IntCounterVec = IntCounterVec::new(
         Opts::new(
@@ -228,24 +274,46 @@ register_metrics! {
         Counter::new("total_landed_subsidies_sum", "Sum of all total landed subsidies").unwrap();
 
 
+
+    pub static ORDERING_BUILDER_EXECUTED_ORDERS: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("ordering_builder_executed_orders", "Orders executed by ordering builder, stage (base vs pre-filtered) and type (total vs included in the block)")
+            .buckets(exponential_buckets_range(1.0, 10000.0, 200)),
+        &["builder_name","stage","type"]
+    )
+    .unwrap();
+
+    pub static ORDERING_BUILDER_EXECUTED_ORDERS_INCLUDE_RATIO: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("ordering_builder_executed_orders_include_ratio", "Ratio of orders executed by ordering builder vs those included in the block")
+            .buckets(linear_buckets_range(0.0, 1.0, 100)),
+        &["builder_name","stage"]
+    )
+    .unwrap();
+
+
     // Performance metrics related to E2E latency
 
     // Metrics for important step of the block processing
     pub static BLOCK_FILL_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_fill_time", "Block Fill Times (ms)")
-            .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
+            .buckets(exponential_buckets_range(0.01, 3000.0, 200)),
         &["builder_name"]
     )
     .unwrap();
     pub static BLOCK_FINALIZE_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_finalize_time", "Block Finalize Times (ms)")
-            .buckets(exponential_buckets_range(1.0, 3000.0, 100)),
+            .buckets(exponential_buckets_range(0.01, 3000.0, 200)),
+        &[]
+    )
+    .unwrap();
+    pub static BLOCK_FINALIZE_ADJUST_TIME: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("block_finalize_adjust_time", "Block Finalize Adjust Times (ms)")
+            .buckets(exponential_buckets_range(0.01, 300.0, 200)),
         &[]
     )
     .unwrap();
     pub static BLOCK_ROOT_HASH_TIME: HistogramVec = HistogramVec::new(
         HistogramOpts::new("block_root_hash_time", "Block Root Hash Time (ms)")
-            .buckets(exponential_buckets_range(1.0, 2000.0, 100)),
+            .buckets(exponential_buckets_range(0.01, 2000.0, 200)),
         &[]
     )
     .unwrap();
@@ -298,6 +366,14 @@ register_metrics! {
         &[]
     )
     .unwrap();
+
+    pub static TRIGGER_TO_BID_ROUND_TRIP_TIME: HistogramVec = HistogramVec::new(
+        HistogramOpts::new("trigger_to_bid_round_trip_time_us", "Time (in microseconds) it takes from a trigger (new block or competition bid) to get a new bid to make")
+            .buckets(exponential_buckets_range(50.0, 2000000.0, 200)),
+        &[]
+    )
+    .unwrap();
+
 }
 
 // This function should be called periodically to reset histogram metrics.
@@ -311,7 +387,7 @@ pub fn reset_histogram_metrics() {
     }
 
     let now = Instant::now();
-    let mut last_reset = LAST_RESET.lock().unwrap();
+    let mut last_reset = LAST_RESET.lock();
     if now.duration_since(*last_reset) < HISTOGRAM_METRIC_RESET_PERIOD {
         return;
     }
@@ -336,9 +412,12 @@ pub fn reset_histogram_metrics() {
     ORDER_SIM_END_TO_FIRST_BUILD_STARTED_MIN_TIME.reset();
     BLOCK_FILL_START_SEAL_END_TIME.reset();
     BLOCK_SEAL_END_SUBMIT_START_TIME.reset();
+    ORDERING_BUILDER_EXECUTED_ORDERS.reset();
+    ORDERING_BUILDER_EXECUTED_ORDERS_INCLUDE_RATIO.reset();
 }
 
 pub(super) fn set_version(version: Version) {
+    VERSION.reset();
     VERSION
         .with_label_values(&[
             &version.git_commit,
@@ -350,6 +429,7 @@ pub(super) fn set_version(version: Version) {
 
 pub fn update_blocklist_metrics(blocklist: &BlockList) {
     let hash = blocklist_hash(blocklist).to_string();
+    BLOCKLIST_HASH.reset();
     BLOCKLIST_HASH
         .with_label_values(&[&hash[2..] /* remove the 0x */])
         .set(1);
@@ -396,9 +476,14 @@ pub fn inc_simulation_gas_used(gas: u64) {
     SIMULATION_GAS_USED.inc_by(gas);
 }
 
-pub fn set_ordepool_count(txs: usize, bundles: usize) {
+pub fn set_ordepool_stats(txs: usize, bundles: usize, txs_size: usize) {
     ORDERPOOL_TXS.set(txs as i64);
     ORDERPOOL_BUNDLES.set(bundles as i64);
+    ORDERPOOL_TXS_SIZE.set(txs_size as i64);
+}
+
+pub fn inc_order_input_rpc_errors(method: &str) {
+    ORDER_INPUT_RPC_ERROR.with_label_values(&[method]).inc();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -417,10 +502,13 @@ pub fn add_finalized_block_metrics(
 
     BLOCK_FINALIZE_TIME
         .with_label_values(&[])
-        .observe(built_block_trace.finalize_time.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(built_block_trace.finalize_time));
+    BLOCK_FINALIZE_ADJUST_TIME
+        .with_label_values(&[])
+        .observe(duration_ms(built_block_trace.finalize_adjust_time));
     BLOCK_ROOT_HASH_TIME
         .with_label_values(&[])
-        .observe(built_block_trace.root_hash_time.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(built_block_trace.root_hash_time));
 
     BLOCK_BUILT_TXS
         .with_label_values(&[builder_name])
@@ -453,13 +541,13 @@ pub fn add_block_fill_time(
     }
     BLOCK_FILL_TIME
         .with_label_values(&[builder_name])
-        .observe(duration.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(duration));
 }
 
 pub fn add_block_validation_time(duration: Duration) {
     BLOCK_VALIDATION_TIME
         .with_label_values(&[])
-        .observe(duration.as_millis() as f64);
+        .observe(duration_ms(duration));
 }
 
 pub fn inc_active_slots() {
@@ -469,13 +557,29 @@ pub fn inc_active_slots() {
 pub fn inc_initiated_submissions(optimistic: bool) {
     INITIATED_SUBMISSIONS
         .with_label_values(&[&optimistic.to_string()])
-        .inc()
+        .inc();
 }
 
 pub fn add_relay_submit_time(relay: &MevBoostRelayID, duration: Duration) {
     RELAY_SUBMIT_TIME
         .with_label_values(&[relay.as_str()])
-        .observe(duration.as_millis() as f64);
+        .observe(duration_ms(duration));
+}
+
+const BIG_RPC_DATA_THRESHOLD: usize = 50000;
+const BIG_RPC_DATA_TEXT: &str = ">50K";
+const SMALL_RPC_DATA_TEXT: &str = "<=50K";
+pub fn add_rpc_processing_time(api: &str, duration: Duration, data_len: usize) {
+    RPC_PROCESSING_TIME
+        .with_label_values(&[
+            api,
+            if data_len > BIG_RPC_DATA_THRESHOLD {
+                BIG_RPC_DATA_TEXT
+            } else {
+                SMALL_RPC_DATA_TEXT
+            },
+        ])
+        .observe(duration.as_micros() as f64);
 }
 
 pub fn inc_relay_accepted_submissions(relay: &MevBoostRelayID, optimistic: bool) {
@@ -487,7 +591,7 @@ pub fn inc_relay_accepted_submissions(relay: &MevBoostRelayID, optimistic: bool)
 pub fn add_txfetcher_time_to_query(duration: Duration) {
     TXFETCHER_TRANSACTION_QUERY_TIME
         .with_label_values(&[])
-        .observe(duration.as_millis() as f64);
+        .observe(duration_ms(duration));
 
     TXFETCHER_TRANSACTION_COUNTER.inc();
 }
@@ -546,6 +650,13 @@ pub fn add_subsidy_value(value: U256, landed: bool) {
     }
 }
 
+pub fn set_builder_balance(balance: U256) {
+    let gwei_balance = balance / U256::from(GWEI_TO_WEI);
+    let u64_gwei_balance: u64 = gwei_balance.try_into().unwrap_or(0);
+    let f64_eth_balance = u64_gwei_balance as f64 / 1_000_000_000.0;
+    BUILDER_BALANCE.set(f64_eth_balance);
+}
+
 fn sim_status(success: bool) -> &'static str {
     if success {
         SIM_STATUS_OK
@@ -557,7 +668,7 @@ fn sim_status(success: bool) -> &'static str {
 pub fn add_order_simulation_time(duration: Duration, builder_name: &str, success: bool) {
     ORDER_SIMULATION_TIME
         .with_label_values(&[builder_name, sim_status(success)])
-        .observe(duration.as_micros() as f64 / 1000.0);
+        .observe(duration_ms(duration));
 }
 
 pub fn mark_submission_start_time(block_sealed_at: OffsetDateTime) {
@@ -567,6 +678,39 @@ pub fn mark_submission_start_time(block_sealed_at: OffsetDateTime) {
     BLOCK_SEAL_END_SUBMIT_START_TIME
         .with_label_values(&[])
         .observe(value);
+}
+
+pub fn inc_root_hash_prefetch_count(fetched_nodes: usize) {
+    if fetched_nodes == 0 {
+        return;
+    }
+    ROOT_HASH_FETCHES
+        .with_label_values(&[ROOT_HASH_PREFETCH_STEP])
+        .inc_by(fetched_nodes.try_into().unwrap_or_default());
+}
+
+pub fn inc_bids_received(bid: &ScrapedRelayBlockBid) {
+    let relay_name = bid.relay_name.as_str();
+    let publisher_name = bid.publisher_name.as_str();
+    let publisher_type = match bid.publisher_type {
+        bid_scraper::types::PublisherType::RelayBids => "relay_bids",
+        bid_scraper::types::PublisherType::RelayHeaders => "relay_headers",
+        bid_scraper::types::PublisherType::UltrasoundWs => "ultrasound_ws",
+        bid_scraper::types::PublisherType::BloxrouteWs => "bloxroute_ws",
+        bid_scraper::types::PublisherType::ExternalWs => "external_ws",
+    };
+    BIDS_RECEIVED
+        .with_label_values(&[relay_name, publisher_name, publisher_type])
+        .inc();
+}
+
+pub fn inc_root_hash_finalize_count(fetched_nodes: usize) {
+    if fetched_nodes == 0 {
+        return;
+    }
+    ROOT_HASH_FETCHES
+        .with_label_values(&[ROOT_HASH_FINALIZE_STEP])
+        .inc_by(fetched_nodes.try_into().unwrap_or_default());
 }
 
 pub fn gather_prometheus_metrics(registry: &Registry) -> String {
@@ -609,4 +753,64 @@ pub fn linear_buckets_range(start: f64, end: f64, n: usize) -> Vec<f64> {
     assert!(start < end);
     let width = (end - start) / (n - 1) as f64;
     prometheus::linear_buckets(start, width, n).unwrap()
+}
+
+pub struct OrderInclusionRatio {
+    total: u64,
+    included: u64,
+}
+
+impl OrderInclusionRatio {
+    pub fn new(total: u64, included: u64) -> Self {
+        Self { total, included }
+    }
+
+    pub fn new_from_failed(total: u64, failed: u64) -> Self {
+        Self {
+            total,
+            included: total - failed,
+        }
+    }
+
+    pub fn ratio(&self) -> f64 {
+        self.included as f64 / self.total as f64
+    }
+}
+
+pub fn add_ordering_builder_orders_executed(
+    builder_name: &str,
+    stage: &str,
+    ratio: OrderInclusionRatio,
+) {
+    if ratio.total == 0 {
+        return;
+    }
+    ORDERING_BUILDER_EXECUTED_ORDERS
+        .with_label_values(&[builder_name, stage, ORDER_EXECUTED])
+        .observe(ratio.total as f64);
+
+    ORDERING_BUILDER_EXECUTED_ORDERS
+        .with_label_values(&[builder_name, stage, ORDER_INCLUDED])
+        .observe(ratio.included as f64);
+    if ratio.total != 0 {
+        ORDERING_BUILDER_EXECUTED_ORDERS_INCLUDE_RATIO
+            .with_label_values(&[builder_name, stage])
+            .observe(ratio.ratio());
+    }
+}
+
+pub fn add_ordering_builder_base_stage_stats(builder_name: &str, ratio: OrderInclusionRatio) {
+    add_ordering_builder_orders_executed(builder_name, BUILDING_STEP_BASE, ratio);
+}
+pub fn add_ordering_builder_pre_filtered_stage_stats(
+    builder_name: &str,
+    ratio: OrderInclusionRatio,
+) {
+    add_ordering_builder_orders_executed(builder_name, BUILDING_STEP_PRE_FILTERED, ratio);
+}
+
+pub fn add_trigger_to_bid_round_trip_time(duration: time::Duration) {
+    TRIGGER_TO_BID_ROUND_TRIP_TIME
+        .with_label_values(&[])
+        .observe(duration.as_seconds_f64() * 1_000_000.0);
 }

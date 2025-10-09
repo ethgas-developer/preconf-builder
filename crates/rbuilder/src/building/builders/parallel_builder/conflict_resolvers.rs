@@ -14,13 +14,11 @@ use super::{
     Algorithm, ConflictTask, ResolutionResult,
 };
 
-use crate::{
-    building::{
-        BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock,
-        ThreadBlockBuildingContext,
-    },
-    primitives::{OrderId, SimulatedOrder},
+use crate::building::{
+    BlockBuildingContext, BlockState, ExecutionError, ExecutionResult, PartialBlock,
+    ThreadBlockBuildingContext,
 };
+use rbuilder_primitives::{OrderId, SimulatedOrder};
 
 /// Context for resolving conflicts in merging tasks.
 
@@ -402,8 +400,8 @@ fn generate_greedy_sequence(task: &ConflictTask, reverse: bool) -> Vec<Vec<usize
     };
 
     vec![
-        create_sequence(|sim_order| sim_order.sim_value.coinbase_profit),
-        create_sequence(|sim_order| sim_order.sim_value.mev_gas_price),
+        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().coinbase_profit()),
+        create_sequence(|sim_order| sim_order.sim_value.full_profit_info().mev_gas_price()),
     ]
 }
 
@@ -429,7 +427,7 @@ fn generate_length_based_sequence(task: &ConflictTask) -> Vec<Vec<usize>> {
             (
                 idx,
                 order.order.list_txs().len(),
-                order.sim_value.coinbase_profit,
+                order.sim_value.full_profit_info().coinbase_profit(),
             )
         })
         .collect();
@@ -456,12 +454,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{
-        building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority},
-        primitives::{
-            Bundle, Metadata, Order, SimValue, SimulatedOrder,
-            TransactionSignedEcRecoveredWithBlobs, LAST_BUNDLE_VERSION,
-        },
+    use crate::building::builders::parallel_builder::{ConflictGroup, GroupId, TaskPriority};
+    use rbuilder_primitives::{
+        Bundle, Metadata, Order, SimValue, SimulatedOrder, TransactionSignedEcRecoveredWithBlobs,
+        LAST_BUNDLE_VERSION,
     };
 
     struct DataGenerator {
@@ -491,7 +487,7 @@ mod tests {
                 ..Default::default()
             };
             Recovered::new_unchecked(
-                TransactionSigned::new(
+                TransactionSigned::new_unchecked(
                     Transaction::Legacy(tx_legacy),
                     alloy_primitives::Signature::test_signature(),
                     self.create_hash(),
@@ -513,11 +509,7 @@ mod tests {
                 );
             }
 
-            let sim_value = SimValue {
-                coinbase_profit,
-                mev_gas_price,
-                ..Default::default()
-            };
+            let sim_value = SimValue::new_test_no_gas(coinbase_profit, mev_gas_price);
 
             let bundle = Bundle {
                 block: Some(0),

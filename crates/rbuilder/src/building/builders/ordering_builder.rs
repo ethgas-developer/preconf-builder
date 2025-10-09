@@ -11,17 +11,22 @@ use crate::{
         builders::{
             block_building_helper::BlockBuildingHelper, LiveBuilderInput, OrderIntakeConsumer,
         },
-        BlockBuildingContext, ExecutionError, OrderPriority, PrioritizedOrderStore,
-        SimulatedOrderSink, Sorting, ThreadBlockBuildingContext,
+        BlockBuildingContext, ExecutionError, NullPartialBlockExecutionTracer, OrderPriority,
+        PartialBlockExecutionTracer, PrioritizedOrderStore, SimulatedOrderSink, Sorting,
+        ThreadBlockBuildingContext,
     },
-    primitives::{AccountNonce, OrderId, SimValue, SimulatedOrder},
+    live_builder::building::built_block_cache::BuiltBlockCache,
     provider::StateProviderFactory,
-    telemetry::mark_builder_considers_order,
+    telemetry::{
+        add_ordering_builder_base_stage_stats, add_ordering_builder_pre_filtered_stage_stats,
+        mark_builder_considers_order, OrderInclusionRatio,
+    },
     utils::NonceCache,
 };
 use ahash::{HashMap, HashSet};
 use alloy_primitives::U256;
 use derivative::Derivative;
+use rbuilder_primitives::{AccountNonce, BlockSpace, OrderId, SimValue, SimulatedOrder};
 use reth_provider::StateProvider;
 use serde::Deserialize;
 use std::{
@@ -38,12 +43,16 @@ use super::{
     BlockBuildingAlgorithmInput,
 };
 
+pub fn default_pre_filtered_build_duration_deadline_ms() -> Option<u64> {
+    Some(0)
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct OrderingBuilderConfig {
     /// If a tx inside a bundle or sbundle fails with TransactionErr (don't confuse this with reverting which is TransactionOk with !.receipt.success)
-    /// and it's configured as allowed to revert (for bundles tx in reverting_tx_hashes, for sbundles: TxRevertBehavior != NotAllowed) we continue the
-    /// the execution of the bundle/sbundle
+    /// and it's configured as allowed to revert (for bundles tx in reverting_tx_hashes or dropping_tx_hashes, for sbundles: TxRevertBehavior != NotAllowed)
+    /// we continue the  execution of the bundle/sbundle. The most typical value is true.
     pub discard_txs: bool,
     pub sorting: Sorting,
     /// Only when a tx fails because the profit was worst than expected: Number of time an order can fail during a single block building iteration.
@@ -58,11 +67,21 @@ pub struct OrderingBuilderConfig {
     /// Amount of time allocated for EVM execution while building block.
     #[serde(default)]
     pub build_duration_deadline_ms: Option<u64>,
+    /// Amount of time allocated for EVM execution for the second stage in which we only try orders that worked for other builders.
+    #[serde(default = "default_pre_filtered_build_duration_deadline_ms")]
+    pub pre_filtered_build_duration_deadline_ms: Option<u64>,
+    #[serde(default)]
+    /// Use SimValue::non_mempool_profit_info instead of full_profit_info when comparing Orders.
+    pub ignore_mempool_profit_on_bundles: bool,
 }
 
 impl OrderingBuilderConfig {
     pub fn build_duration_deadline(&self) -> Option<Duration> {
         self.build_duration_deadline_ms.map(Duration::from_millis)
+    }
+    pub fn pre_filtered_build_duration_deadline(&self) -> Option<Duration> {
+        self.pre_filtered_build_duration_deadline_ms
+            .map(Duration::from_millis)
     }
 }
 
@@ -101,6 +120,7 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
         input.builder_name,
         input.ctx,
         config.clone(),
+        input.built_block_cache,
     );
 
     // this is a hack to mark used orders until built block trace is implemented as a sane thing
@@ -152,9 +172,14 @@ pub fn run_ordering_builder<P, OrderPriorityType>(
     }
 }
 
-pub fn backtest_simulate_block<P, OrderPriorityType: OrderPriority>(
+pub fn backtest_simulate_block<
+    P,
+    OrderPriorityType: OrderPriority,
+    PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
+>(
     ordering_config: OrderingBuilderConfig,
     input: BacktestSimulateBlockInput<'_, P>,
+    partial_block_execution_tracer: PartialBlockExecutionTracerType,
 ) -> eyre::Result<Block>
 where
     P: StateProviderFactory + Clone + 'static,
@@ -162,21 +187,24 @@ where
     let use_suggested_fee_recipient_as_coinbase = ordering_config.coinbase_payment;
     let state_provider = input
         .provider
-        .history_by_block_number(input.ctx.evm_env.block_env.number - 1)?;
+        .history_by_block_number(input.ctx.block() - 1)?;
     let block_orders =
         block_orders_from_sim_orders::<OrderPriorityType>(input.sim_orders, &state_provider)?;
     let mut local_ctx = ThreadBlockBuildingContext::default();
-    let preconf_reserved_gas = block_orders.get_bottom_preconf_gas() + block_orders.get_payout_preconf_gas();
+    let preconf_reserved_gas =
+        block_orders.get_bottom_preconf_space() + block_orders.get_payout_preconf_space();
     let mut builder = OrderingBuilderContext::new(
         Arc::from(state_provider),
         input.builder_name,
         input.ctx.clone(),
         ordering_config,
+        Arc::new(BuiltBlockCache::new()),
     );
-    let block_builder = builder.build_block(
+    let mut block_builder = builder.build_block_with_execution_tracer(
         block_orders,
         use_suggested_fee_recipient_as_coinbase,
         CancellationToken::new(),
+        partial_block_execution_tracer,
         preconf_reserved_gas,
     )?;
 
@@ -205,6 +233,7 @@ pub struct OrderingBuilderContext {
     // scratchpad
     failed_orders: HashSet<OrderId>,
     order_attempts: HashMap<OrderId, usize>,
+    built_block_cache: Arc<BuiltBlockCache>,
 }
 
 impl OrderingBuilderContext {
@@ -213,6 +242,7 @@ impl OrderingBuilderContext {
         builder_name: String,
         ctx: BlockBuildingContext,
         config: OrderingBuilderConfig,
+        built_block_cache: Arc<BuiltBlockCache>,
     ) -> Self {
         Self {
             state,
@@ -222,33 +252,53 @@ impl OrderingBuilderContext {
             config,
             failed_orders: HashSet::default(),
             order_attempts: HashMap::default(),
+            built_block_cache,
         }
     }
 
-    /// use_suggested_fee_recipient_as_coinbase: all the mev profit goes directly to the slot suggested_fee_recipient so we avoid the payout tx.
-    ///     This mode disables mev-share orders since the builder has to receive the mev profit to give some portion back to the mev-share user.
-    /// !use_suggested_fee_recipient_as_coinbase: all the mev profit goes to the builder and at the end of the block we pay to the suggested_fee_recipient.
     pub fn build_block<OrderPriorityType: OrderPriority>(
         &mut self,
         block_orders: PrioritizedOrderStore<OrderPriorityType>,
         use_suggested_fee_recipient_as_coinbase: bool,
         cancel_block: CancellationToken,
-        preconf_reserved_gas: u64,
+        preconf_reserved_space: BlockSpace,
+    ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
+        self.build_block_with_execution_tracer(
+            block_orders,
+            use_suggested_fee_recipient_as_coinbase,
+            cancel_block,
+            NullPartialBlockExecutionTracer {},
+            preconf_reserved_space,
+        )
+    }
+
+    /// use_suggested_fee_recipient_as_coinbase: all the mev profit goes directly to the slot suggested_fee_recipient so we avoid the payout tx.
+    ///     This mode disables mev-share orders since the builder has to receive the mev profit to give some portion back to the mev-share user.
+    /// !use_suggested_fee_recipient_as_coinbase: all the mev profit goes to the builder and at the end of the block we pay to the suggested_fee_recipient.
+    pub fn build_block_with_execution_tracer<
+        OrderPriorityType: OrderPriority,
+        PartialBlockExecutionTracerType: PartialBlockExecutionTracer + Clone + Send + Sync + 'static,
+    >(
+        &mut self,
+        mut block_orders: PrioritizedOrderStore<OrderPriorityType>,
+        use_suggested_fee_recipient_as_coinbase: bool,
+        cancel_block: CancellationToken,
+        partial_block_execution_tracer: PartialBlockExecutionTracerType,
+        preconf_reserved_space: BlockSpace,
     ) -> eyre::Result<Box<dyn BlockBuildingHelper>> {
         let gas_limit = U256::from(self.ctx.evm_env.block_env.gas_limit);
-        let forced_empty_block = U256::from(preconf_reserved_gas).eq(&gas_limit);
+        let forced_empty_block = U256::from(preconf_reserved_space.gas).eq(&gas_limit);
         let contains_preconf = block_orders.contains_preconf();
         let enabled_self_payout = forced_empty_block && !contains_preconf;
         let enabled_coinbase_payout =
             !enabled_self_payout && use_suggested_fee_recipient_as_coinbase;
 
         trace!(
-            "enabled_coinbase_payout: {:?} -> enabled_self_payout: {:?}(forced_empty_block: {:?}, contains_preconf: {:?}), use_suggested_fee_recipient_as_coinbase: {:?}",
+            "enabled_coinbase_payout: {:?} -> enabled_self_payout: {:?}(forced_empty_block: {:?}, contains_preconf: {:?})",
             enabled_coinbase_payout,
             enabled_self_payout,
             forced_empty_block,
             contains_preconf,
-            use_suggested_fee_recipient_as_coinbase
         );
 
         let build_attempt_id: u32 = rand::random();
@@ -265,44 +315,114 @@ impl OrderingBuilderContext {
         }
         self.failed_orders.clear();
         self.order_attempts.clear();
-        let bottom_preconf_gas = block_orders.get_bottom_preconf_gas();
-        let payout_preconf_gas = block_orders.get_payout_preconf_gas();
+        let bottom_preconf_space = block_orders.get_bottom_preconf_space();
+        let payout_preconf_space = block_orders.get_payout_preconf_space();
 
-        let reserved_gas = preconf_reserved_gas + bottom_preconf_gas + payout_preconf_gas;
+        let reserved_gas = preconf_reserved_space + bottom_preconf_space + payout_preconf_space;
         trace!(
             "reserved_gas: {:?} = preconf_reserved_gas: {:?}, bottom_preconf_gas: {:?}, payout_preconf_gas: {:?}",
-            reserved_gas,
-            preconf_reserved_gas,
-            bottom_preconf_gas,
-            payout_preconf_gas
+            reserved_gas.gas,
+            preconf_reserved_space.gas,
+            bottom_preconf_space.gas,
+            payout_preconf_space.gas,
         );
-        let mut block_building_helper = BlockBuildingHelperFromProvider::new(
+        let mut block_building_helper = BlockBuildingHelperFromProvider::new_with_execution_tracer(
             self.state.clone(),
             new_ctx,
             &mut self.local_ctx,
             self.builder_name.clone(),
             self.config.discard_txs,
             reserved_gas,
-            enabled_self_payout,
+            block_orders.orders_statistics(),
             cancel_block,
+            partial_block_execution_tracer,
         )?;
-
-        self.fill_orders(&mut block_building_helper, block_orders, bottom_preconf_gas, payout_preconf_gas, build_start).expect("fill_orders should not fail");
+        self.fill_orders(
+            &mut block_building_helper,
+            &mut block_orders,
+            |_| true,
+            build_start,
+            self.config.build_duration_deadline(),
+            bottom_preconf_space,
+            payout_preconf_space,
+        )?;
+        add_ordering_builder_base_stage_stats(
+            self.builder_name.as_str(),
+            OrderInclusionRatio::new_from_failed(
+                block_building_helper
+                    .built_block_trace()
+                    .considered_orders_statistics
+                    .total(),
+                block_building_helper
+                    .built_block_trace()
+                    .failed_orders_statistics
+                    .total(),
+            ),
+        );
+        if self.config.pre_filtered_build_duration_deadline_ms != Some(0) {
+            // Consider aggregate all the BuiltBlockInfos.
+            let block_infos = self.built_block_cache.get_block_infos(&self.builder_name);
+            if !block_infos.is_empty() {
+                let base_considered_orders_statistics = block_building_helper
+                    .built_block_trace()
+                    .considered_orders_statistics
+                    .clone();
+                let base_failed_orders_statistics = block_building_helper
+                    .built_block_trace()
+                    .failed_orders_statistics
+                    .clone();
+                self.fill_orders(
+                    &mut block_building_helper,
+                    &mut block_orders,
+                    |sim_order| {
+                        block_infos
+                            .iter()
+                            .any(|block_info| block_info.contains_order(&sim_order.order))
+                    },
+                    build_start,
+                    self.config
+                        .pre_filtered_build_duration_deadline()
+                        .map(|d| build_start.elapsed() + d),
+                    bottom_preconf_space,
+                    payout_preconf_space,
+                )?;
+                let considered_stats = block_building_helper
+                    .built_block_trace()
+                    .considered_orders_statistics
+                    .clone()
+                    - base_considered_orders_statistics;
+                let failed_stats = block_building_helper
+                    .built_block_trace()
+                    .failed_orders_statistics
+                    .clone()
+                    - base_failed_orders_statistics;
+                add_ordering_builder_pre_filtered_stage_stats(
+                    self.builder_name.as_str(),
+                    OrderInclusionRatio::new_from_failed(
+                        considered_stats.total(),
+                        failed_stats.total(),
+                    ),
+                );
+                block_building_helper.set_filtered_build_statistics(considered_stats, failed_stats);
+            }
+        }
         block_building_helper.set_trace_fill_time(build_start.elapsed());
+
         Ok(Box::new(block_building_helper))
     }
 
-    fn fill_orders<OrderPriorityType: OrderPriority>(
+    fn fill_orders<OrderPriorityType: OrderPriority, OrderFilter: Fn(&SimulatedOrder) -> bool>(
         &mut self,
         block_building_helper: &mut dyn BlockBuildingHelper,
-        mut block_orders: PrioritizedOrderStore<OrderPriorityType>,
-        bottom_preconf_gas: u64,
-        payout_preconf_gas: u64,
+        block_orders: &mut PrioritizedOrderStore<OrderPriorityType>,
+        order_filter: OrderFilter,
         build_start: Instant,
+        deadline: Option<Duration>,
+        bottom_preconf_space: BlockSpace,
+        payout_preconf_space: BlockSpace,
     ) -> eyre::Result<()> {
         let mut bottom_preconf: Option<Arc<SimulatedOrder>> = None;
         let mut payout_preconf: Option<Arc<SimulatedOrder>> = None;
-        let mut order_attempts: HashMap<OrderId, usize> = HashMap::default();
         // @Perf when gas left is too low, we should break.
         while let Some(sim_order) = block_orders.pop_order() {
             if sim_order.is_bottom_preconf() {
@@ -316,11 +436,11 @@ impl OrderingBuilderContext {
             }
             // @Todo we drop such bundles instead of failing simulation for them
             // because share bundle merging depends on allowing no txs bundles into the block
-            if sim_order.sim_value.gas_used == 0 {
+            if sim_order.sim_value.gas_used() == 0 || !order_filter(&sim_order) {
                 continue;
             }
 
-            if let Some(deadline) = self.config.build_duration_deadline() {
+            if let Some(deadline) = deadline {
                 if build_start.elapsed() > deadline {
                     break;
                 }
@@ -345,7 +465,7 @@ impl OrderingBuilderContext {
             let success = commit_result.is_ok();
             match commit_result {
                 Ok(res) => {
-                    gas_used = res.gas_used;
+                    gas_used = res.space_used.gas;
                     // This intermediate step is needed until we replace all (Address, u64) for AccountNonce
                     let nonces_updated: Vec<_> = res
                         .nonces_updated
@@ -360,7 +480,7 @@ impl OrderingBuilderContext {
                 Err(err) => {
                     if let ExecutionError::LowerInsertedValue { inplace, .. } = &err {
                         // try to reinsert order into the map
-                        let order_attempts = order_attempts.entry(sim_order.id()).or_insert(0);
+                        let order_attempts = self.order_attempts.entry(sim_order.id()).or_insert(0);
                         if *order_attempts < self.config.failed_order_retries {
                             let mut new_order = (*sim_order).clone();
                             new_order.sim_value = inplace.clone();
@@ -388,18 +508,20 @@ impl OrderingBuilderContext {
         if bottom_preconf.is_some() {
             self.refill_preconf_order(
                 block_building_helper,
-                &mut block_orders,
+                block_orders,
                 bottom_preconf.unwrap(),
-                bottom_preconf_gas,
-            ).expect("bottom preconf order should not fail");
+                bottom_preconf_space,
+            )
+            .expect("bottom preconf order should not fail");
         }
         if payout_preconf.is_some() {
             self.refill_preconf_order(
                 block_building_helper,
-                &mut block_orders,
+                block_orders,
                 payout_preconf.unwrap(),
-                payout_preconf_gas,
-            ).expect("payout preconf order should not fail");
+                payout_preconf_space,
+            )
+            .expect("payout preconf order should not fail");
         }
         Ok(())
     }
@@ -409,14 +531,14 @@ impl OrderingBuilderContext {
         block_building_helper: &mut dyn BlockBuildingHelper,
         block_orders: &mut PrioritizedOrderStore<OrderPriorityType>,
         preconf_order: Arc<SimulatedOrder>,
-        gas_limit: u64,
+        gas_limit: BlockSpace,
     ) -> Result<(), Box<dyn std::error::Error>> {
         mark_builder_considers_order(
             preconf_order.id(),
             &block_building_helper.built_block_trace().orders_closed_at,
             block_building_helper.builder_name(),
         );
-        block_building_helper.deduct_reserve_gas(gas_limit);
+        block_building_helper.deduct_reserved_space(gas_limit);
         let start_time = Instant::now();
         let commit_result = block_building_helper.commit_order(
             &mut self.local_ctx,
@@ -431,7 +553,7 @@ impl OrderingBuilderContext {
         let success = commit_result.is_ok();
         match commit_result {
             Ok(res) => {
-                preconf_gas_used = res.gas_used;
+                preconf_gas_used = res.space_used.gas;
                 // This intermediate step is needed until we replace all (Address, u64) for AccountNonce
                 let nonces_updated: Vec<_> = res
                     .nonces_updated
@@ -502,6 +624,7 @@ where
             sink: input.sink,
             builder_name: self.name.clone(),
             cancel: input.cancel,
+            built_block_cache: input.built_block_cache,
             preconf_reserved_gas: input.preconf_reserved_gas,
         };
         run_ordering_builder::<P, OrderPriorityType>(live_input, &self.config);
@@ -528,88 +651,78 @@ fn simulation_too_low<OrderPriorityType: OrderPriority>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::building::order_priority::{OrderMaxProfitPriority, OrderMevGasPricePriority};
+    use crate::building::order_priority::{
+        FullProfitInfoGetter, OrderMaxProfitPriority, OrderMevGasPricePriority,
+    };
     use alloy_primitives::U256;
 
     #[test]
     fn test_simulation_too_low_max_profit() {
-        let sim_result = &SimValue {
-            coinbase_profit: U256::from(100),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(94),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
+        let sim_result = &SimValue::new_test_no_gas(U256::from(100), U256::from(0));
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(94), U256::from(0));
 
         // Lower than 95% of the original value
         assert!(
-            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_err()
+            simulation_too_low::<OrderMaxProfitPriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_err()
         );
 
         // Equal to original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(100),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(100), U256::from(0));
         assert!(
-            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMaxProfitPriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
 
         // Higher than original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(105),
-            mev_gas_price: U256::from(0),
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(105), U256::from(0));
         assert!(
-            simulation_too_low::<OrderMaxProfitPriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMaxProfitPriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
     }
 
     #[test]
     fn test_simulation_too_low_mev_gas_price() {
-        let sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(100),
-            gas_used: 100,
-            ..Default::default()
-        };
-
+        let sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(100));
         // Lower than 95% of the original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(94),
-            gas_used: 94,
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(94));
+
         assert!(
-            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_err()
+            simulation_too_low::<OrderMevGasPricePriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_err()
         );
 
         // Equal to original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(100),
-            gas_used: 105,
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(100));
         assert!(
-            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMevGasPricePriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
 
         // Higher than original value
-        let inplace_sim_result = &SimValue {
-            coinbase_profit: U256::from(0),
-            mev_gas_price: U256::from(105),
-            gas_used: 105,
-            ..Default::default()
-        };
+        let inplace_sim_result = &SimValue::new_test_no_gas(U256::from(0), U256::from(105));
         assert!(
-            simulation_too_low::<OrderMevGasPricePriority>(sim_result, inplace_sim_result).is_ok()
+            simulation_too_low::<OrderMevGasPricePriority::<FullProfitInfoGetter>>(
+                sim_result,
+                inplace_sim_result
+            )
+            .is_ok()
         );
     }
 }

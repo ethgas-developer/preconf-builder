@@ -1,13 +1,13 @@
 use std::{collections::hash_map::Entry, sync::Arc};
 
+use crate::telemetry::mark_order_not_ready_for_immediate_inclusion;
 use ahash::{HashMap, HashSet};
 use alloy_primitives::Address;
 use priority_queue::PriorityQueue;
-use tracing::debug;
-use crate::{
-    primitives::{AccountNonce, Nonce, OrderId, SimulatedOrder},
-    telemetry::mark_order_not_ready_for_immediate_inclusion,
+use rbuilder_primitives::{
+    order_statistics::OrderStatistics, AccountNonce, BlockSpace, Nonce, OrderId, SimulatedOrder,
 };
+use tracing::debug;
 
 use super::{OrderPriority, SimulatedOrderSink};
 
@@ -16,11 +16,11 @@ use super::{OrderPriority, SimulatedOrderSink};
 /// Order must implement BlockOrdersOrder which has priority(). This priority is used to sort the simulated orders.
 /// Usage:
 /// - Add new order (a little bit complex):
-///     ALWAYS BE SURE THAT YOU CALLED update_onchain_nonces and updated the current state of all the needed nonces by the order
-///     call insert_order
+///   ALWAYS BE SURE THAT YOU CALLED update_onchain_nonces and updated the current state of all the needed nonces by the order
+///   call insert_order
 /// - Get best order to execute
-///     call pop_order to get the best order
-///     if the order is executed call update_onchain_nonces to update all the changed nonces.
+///   call pop_order to get the best order
+///   if the order is executed call update_onchain_nonces to update all the changed nonces.
 /// - Remove orders: remove_orders. This is useful if we think this orders are no really good (failed to execute to often)
 #[derive(Debug, Clone)]
 pub struct PrioritizedOrderStore<OrderPriorityType> {
@@ -39,6 +39,8 @@ pub struct PrioritizedOrderStore<OrderPriorityType> {
     pending_orders: HashMap<AccountNonce, Vec<OrderId>>,
     /// Id -> order for all orders we manage. Carefully maintained by remove/insert
     orders: HashMap<OrderId, Arc<SimulatedOrder>>,
+    /// Everything in orders
+    orders_statistics: OrderStatistics,
 }
 
 impl<OrderPriorityType: OrderPriority> PrioritizedOrderStore<OrderPriorityType> {
@@ -53,7 +55,12 @@ impl<OrderPriorityType: OrderPriority> PrioritizedOrderStore<OrderPriorityType> 
             onchain_nonces,
             pending_orders: HashMap::default(),
             orders: HashMap::default(),
+            orders_statistics: Default::default(),
         }
+    }
+
+    pub fn orders_statistics(&self) -> OrderStatistics {
+        self.orders_statistics.clone()
     }
 
     pub fn pop_order(&mut self) -> Option<Arc<SimulatedOrder>> {
@@ -67,7 +74,7 @@ impl<OrderPriorityType: OrderPriority> PrioritizedOrderStore<OrderPriorityType> 
 
     /// Clean up after some order was removed from main_queue
     fn remove_poped_order(&mut self, id: &OrderId) -> Option<Arc<SimulatedOrder>> {
-        let sim_order = self.orders.remove(id)?;
+        let sim_order = self.remove_from_orders(id)?;
         for Nonce { address, .. } in sim_order.order.nonces() {
             match self.main_queue_nonces.entry(address) {
                 Entry::Occupied(mut entry) => {
@@ -135,7 +142,7 @@ impl<OrderPriorityType: OrderPriority> PrioritizedOrderStore<OrderPriorityType> 
             if let Some(pending) = self.pending_orders.remove(new_nonce) {
                 let orders = pending
                     .iter()
-                    .filter_map(|id| self.orders.remove(id))
+                    .filter_map(|id| self.remove_from_orders(id))
                     .collect::<Vec<_>>();
                 for order in orders {
                     self.insert_order(order);
@@ -148,32 +155,59 @@ impl<OrderPriorityType: OrderPriority> PrioritizedOrderStore<OrderPriorityType> 
         self.orders.values().cloned().collect()
     }
 
+    /// Removes from self.orders and updates statistics
+    fn remove_from_orders(&mut self, id: &OrderId) -> Option<Arc<SimulatedOrder>> {
+        let res = self.orders.remove(id);
+        if let Some(sim_order) = &res {
+            self.orders_statistics.remove(&sim_order.order);
+        }
+        res
+    }
+
     pub fn print_priority_queue(&self, tag: &str) {
         debug!("[{}] current main queue: {:?}", tag, self.main_queue);
     }
 
-    pub fn get_bottom_preconf_gas(&self) -> u64 {
+    pub fn get_bottom_preconf_space(&self) -> BlockSpace {
         let mut gas = 0;
+        let mut rlp_length = 0usize;
+        let mut blob_gas = 0;
         self.orders.iter().for_each(|(_, sim_order)| {
             if sim_order.is_bottom_preconf() {
                 gas += sim_order.order.get_gas_limit();
+                rlp_length += sim_order.order.get_rlp_length();
+                blob_gas += sim_order.order.get_blob_gas();
             }
         });
-        gas
+        BlockSpace {
+            gas,
+            rlp_length,
+            blob_gas,
+        }
     }
 
-    pub fn get_payout_preconf_gas(&self) -> u64 {
+    pub fn get_payout_preconf_space(&self) -> BlockSpace {
         let mut gas = 0;
+        let mut rlp_length = 0usize;
+        let mut blob_gas = 0;
         self.orders.iter().for_each(|(_, sim_order)| {
             if sim_order.is_payout_preconf() {
                 gas += sim_order.order.get_gas_limit();
+                rlp_length += sim_order.order.get_rlp_length();
+                blob_gas += sim_order.order.get_blob_gas();
             }
         });
-        gas
+        BlockSpace {
+            gas,
+            rlp_length,
+            blob_gas,
+        }
     }
 
     pub fn contains_preconf(&self) -> bool {
-        self.orders.iter().any(|(_, sim_order)| sim_order.is_preconf())
+        self.orders
+            .iter()
+            .any(|(_, sim_order)| sim_order.is_preconf())
     }
 }
 
@@ -232,6 +266,8 @@ impl<OrderPriorityType: OrderPriority> SimulatedOrderSink
                 }
             }
         }
+        self.orders_statistics.add(&sim_order.order);
+        // We don't check the result to update orders_statistics since we already checked !self.orders.contains_key
         self.orders.insert(sim_order.id(), sim_order);
     }
 
@@ -240,6 +276,6 @@ impl<OrderPriorityType: OrderPriority> SimulatedOrderSink
         if self.main_queue.remove(&id).is_some() {
             self.remove_poped_order(&id);
         }
-        self.orders.remove(&id)
+        self.remove_from_orders(&id)
     }
 }
